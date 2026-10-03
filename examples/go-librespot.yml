@@ -1,0 +1,19 @@
+# Copy to ~/.config/go-librespot/config.yml for a new installation.
+# Merge these settings into an existing configuration instead of overwriting it.
+device_name: Omarchy DJ
+device_type: computer
+audio_backend: pulseaudio
+bitrate: 320
+initial_volume: 50
+mpris_enabled: true
+zeroconf_enabled: false
+credentials:
+  type: device_auth
+log_level: info
+prefer_firewall_friendly_ports: true
+server:
+  enabled: true
+  address: 127.0.0.1
+  port: 3678
+metadata:
+  enabled: true
