@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Build the pinned DJamp extension without changing the stock backend or config.
+set -euo pipefail
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/build-backend [--output PATH]
+
+Build and test the pinned go-librespot DJ extension, then atomically install it.
+Default output: ~/.local/bin/go-librespot-djamp
+Cache override: DJAMP_BACKEND_CACHE (default: $XDG_CACHE_HOME/djamp/backend)
+Requires Linux, Git, Go, a C compiler, pkg-config and audio development libraries.
+EOF
+}
+
+output="${HOME}/.local/bin/go-librespot-djamp"
+while (($#)); do
+  case "$1" in
+    --output)
+      if (($# < 2)) || [[ -z "$2" ]]; then
+        printf '%s\n' '--output requires a path' >&2
+        exit 2
+      fi
+      output="$2"
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../backend/upstream.env
+source "$repo_root/backend/upstream.env"
+patch_file="$repo_root/backend/go-librespot-dj-start.patch"
+
+if [[ "$(uname -s)" != Linux ]]; then
+  printf '%s\n' 'The DJamp backend build currently supports Linux.' >&2
+  exit 1
+fi
+for dependency in git go cc pkg-config tar mktemp install flock; do
+  if ! command -v "$dependency" >/dev/null; then
+    printf 'Missing build dependency: %s\n' "$dependency" >&2
+    exit 1
+  fi
+done
+if ! pkg-config --exists alsa vorbis ogg flac libmpg123; then
+  printf '%s\n' 'Missing audio development libraries: alsa, vorbis, ogg, flac, libmpg123.' >&2
+  printf '%s\n' 'On Arch/Omarchy install: base-devel git go alsa-lib libvorbis libogg flac mpg123.' >&2
+  exit 1
+fi
+
+# Normalize the output before entering the temporary source tree.
+mkdir -p -- "$(dirname -- "$output")"
+output="$(cd -- "$(dirname -- "$output")" && pwd)/$(basename -- "$output")"
+if [[ -d "$output" ]]; then
+  printf 'Output is a directory: %s\n' "$output" >&2
+  exit 2
+fi
+cache_dir="${DJAMP_BACKEND_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/djamp/backend}"
+mkdir -p -- "$cache_dir"
+cache_dir="$(cd -- "$cache_dir" && pwd)"
+# Concurrent builds share source objects but must not initialize/fetch together.
+exec 9>"$cache_dir/build.lock"
+flock 9
+source_cache="$cache_dir/upstream.git"
+if [[ ! -d "$source_cache" ]]; then
+  git init --quiet --bare "$source_cache"
+fi
+if ! git --git-dir="$source_cache" cat-file -e "$BACKEND_COMMIT^{commit}" 2>/dev/null; then
+  printf 'Fetching go-librespot source %s...\n' "$BACKEND_COMMIT"
+  git --git-dir="$source_cache" fetch --quiet --depth 1 "$BACKEND_REPOSITORY" "$BACKEND_COMMIT"
+fi
+actual_commit="$(git --git-dir="$source_cache" rev-parse "$BACKEND_COMMIT^{commit}")"
+if [[ "$actual_commit" != "$BACKEND_COMMIT" ]]; then
+  printf '%s\n' 'Source commit verification failed.' >&2
+  exit 1
+fi
+
+build_dir="$(mktemp -d "$cache_dir/build.XXXXXXXX")"
+output_tmp=''
+cleanup() {
+  if [[ -n "$output_tmp" ]]; then rm -f -- "$output_tmp"; fi
+  rm -rf -- "$build_dir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+git --git-dir="$source_cache" archive "$BACKEND_COMMIT" | tar -x -C "$build_dir"
+git -C "$build_dir" apply --check "$patch_file"
+git -C "$build_dir" apply "$patch_file"
+(
+  cd -- "$build_dir"
+  printf '%s\n' 'Testing backend...'
+  go test -mod=readonly -tags test_unit ./daemon ./spclient ./tracks ./cmd/daemon
+  printf 'Building %s...\n' "$BACKEND_VERSION"
+  CGO_ENABLED=1 go build -mod=readonly -trimpath -buildvcs=false \
+    -ldflags "-s -w -X github.com/devgianlu/go-librespot.version=$BACKEND_VERSION" \
+    -o go-librespot-djamp ./cmd/daemon
+)
+
+# The temporary output is on the target filesystem, so rename is atomic even
+# when the cache and installation live on separate filesystems.
+output_tmp="$(mktemp "${output}.tmp.XXXXXXXX")"
+install -m 755 -- "$build_dir/go-librespot-djamp" "$output_tmp"
+mv -fT -- "$output_tmp" "$output"
+output_tmp=''
+printf 'Installed %s at %s\n' "$BACKEND_VERSION" "$output"

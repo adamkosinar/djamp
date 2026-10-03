@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Unified patches contain significant context prefixes.
+*.patch -whitespace

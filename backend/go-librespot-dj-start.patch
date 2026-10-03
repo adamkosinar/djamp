@@ -1,0 +1,1322 @@
+diff --git a/api-spec.yml b/api-spec.yml
+index 662db9f..ff0759c 100644
+--- a/api-spec.yml
++++ b/api-spec.yml
+@@ -248,8 +248,11 @@ components:
+       x-go-name: ApiRoot
+       description: API reachability and playback readiness
+       type: object
+-      required: [ playback_ready ]
++      required: [ playback_ready, direct_dj ]
+       properties:
++        direct_dj:
++          description: Whether /player/play can start a Spotify DJ session directly
++          type: boolean
+         playback_ready:
+           description: >-
+             Whether the daemon is fully bootstrapped and ready to accept
+diff --git a/cmd/daemon/file_state_store_test.go b/cmd/daemon/file_state_store_test.go
+index 343a799..11b63bc 100644
+--- a/cmd/daemon/file_state_store_test.go
++++ b/cmd/daemon/file_state_store_test.go
+@@ -3,6 +3,7 @@
+ package main
+ 
+ import (
++	"os"
+ 	"path/filepath"
+ 	"testing"
+ 
+@@ -30,3 +31,32 @@ func TestFileStateStoreSaveReplacesExisting(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Equal(t, "device-2", loaded.DeviceId)
+ }
++
++func TestFileStateStorePreservesCredentialsAndDJCursor(t *testing.T) {
++	dir := t.TempDir()
++	statePath := filepath.Join(dir, "state.json")
++	store := NewFileStateStore(statePath, "", &librespot.NullLogger{})
++	state := &librespot.AppState{DeviceId: "device-1", DJCursors: map[string]librespot.DJCursor{
++		"account-a": {RootFingerprint: "first-root", NextPageURL: "first-page"},
++		"account-b": {RootFingerprint: "other-root", NextPageURL: "other-page"},
++	}}
++	state.Credentials.Username = "account-a"
++	state.Credentials.Data = []byte("test-credential")
++	volume := uint32(30)
++	state.LastVolume = &volume
++	require.NoError(t, store.Save(state))
++	state.DJCursors["account-a"] = librespot.DJCursor{RootFingerprint: "first-root", NextPageURL: "next-page"}
++	require.NoError(t, store.Save(state))
++	loaded, err := store.Load()
++	require.NoError(t, err)
++	require.Equal(t, state.DJCursors, loaded.DJCursors)
++	require.Equal(t, state.Credentials, loaded.Credentials)
++	require.Equal(t, state.DeviceId, loaded.DeviceId)
++	require.Equal(t, state.LastVolume, loaded.LastVolume)
++	info, err := os.Stat(statePath)
++	require.NoError(t, err)
++	require.Zero(t, info.Mode().Perm()&0077, "cursor and credentials must remain private")
++	entries, err := os.ReadDir(dir)
++	require.NoError(t, err)
++	require.Len(t, entries, 1, "atomic saves should leave no temporary files")
++}
+diff --git a/daemon/api_gen.go b/daemon/api_gen.go
+index 4be8c8d..8d5dd70 100644
+--- a/daemon/api_gen.go
++++ b/daemon/api_gen.go
+@@ -107,6 +107,9 @@ type ApiRepeatTrack struct {
+ 
+ // ApiRoot API reachability and playback readiness
+ type ApiRoot struct {
++	// DirectDj Whether /player/play can start a Spotify DJ session directly
++	DirectDj bool `json:"direct_dj"`
++
+ 	// PlaybackReady Whether the daemon is fully bootstrapped and ready to accept /player/play
+ 	PlaybackReady bool `json:"playback_ready"`
+ }
+diff --git a/daemon/api_server_test.go b/daemon/api_server_test.go
+index 63aa856..08aa79c 100644
+--- a/daemon/api_server_test.go
++++ b/daemon/api_server_test.go
+@@ -167,13 +167,13 @@ func TestApiRejectsWrongMethod(t *testing.T) {
+ 
+ func TestApiRoot(t *testing.T) {
+ 	ts := newTestServer(t, func(ApiRequest) (any, error) {
+-		return &ApiRoot{PlaybackReady: true}, nil
++		return &ApiRoot{PlaybackReady: true, DirectDj: true}, nil
+ 	})
+ 
+ 	resp := ts.do(http.MethodGet, "/", nil)
+ 	require.Equal(t, http.StatusOK, resp.StatusCode)
+ 	require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+-	require.JSONEq(t, `{"playback_ready":true}`, body(t, resp))
++	require.JSONEq(t, `{"playback_ready":true,"direct_dj":true}`, body(t, resp))
+ 
+ 	require.Equal(t, ApiRequestTypeRoot, ts.request().Type)
+ }
+diff --git a/daemon/app.go b/daemon/app.go
+index 1479539..fe55fa7 100644
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -59,7 +59,8 @@ type App struct {
+ 	saving    bool
+ 	saveDirty bool
+ 
+-	closed bool
++	closeOnce sync.Once
++	closeErr  error
+ }
+ 
+ func parseDeviceType(val string) (devicespb.DeviceType, error) {
+@@ -201,11 +202,19 @@ func (app *App) Run(ctx context.Context) error {
+ 
+ // Close releases resources held by the daemon. It is safe to call more than once.
+ func (app *App) Close() error {
+-	if app.closed {
+-		return nil
++	// Run's cancellation goroutine and the command's defer can close at the
++	// same time. Both must wait for the state flush before the process exits.
++	app.closeOnce.Do(func() { app.closeErr = app.close() })
++	// Run's cancellation goroutine may close resources before the player
++	// loop has finished its last commit. Flush on every Close so the main
++	// command's deferred call, after Run returns, saves that final state too.
++	if app.state != nil && app.stateStore != nil {
++		return errors.Join(app.closeErr, app.persistState())
+ 	}
+-	app.closed = true
++	return app.closeErr
++}
+ 
++func (app *App) close() error {
+ 	var errs []error
+ 	if app.server != nil {
+ 		if err := app.server.Close(); err != nil {
+@@ -220,7 +229,6 @@ func (app *App) Close() error {
+ 	if app.zeroconf != nil {
+ 		app.zeroconf.Close()
+ 	}
+-
+ 	return errors.Join(errs...)
+ }
+ 
+@@ -591,7 +599,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
+ 				if sess == nil {
+ 					switch req.Type {
+ 					case ApiRequestTypeRoot:
+-						req.Reply(&ApiRoot{}, nil)
++						req.Reply(&ApiRoot{DirectDj: true}, nil)
+ 					case ApiRequestSetDeviceName:
+ 						// The device name drives the zeroconf advertisement, which
+ 						// runs independently of any player session, so handle it
+diff --git a/daemon/controls.go b/daemon/controls.go
+index 27f3dd1..e270f58 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -325,6 +325,7 @@ type skipToFunc func(*connectpb.ContextTrack) bool
+ // and walking it to the starting track runs on the loader lane, and the track
+ // it lands on is loaded once it has.
+ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, paused, drop bool, then func(error)) {
++	p.djPlayback = nil
+ 	p.state.setPaused(paused)
+ 
+ 	sessionId := make([]byte, 16)
+@@ -419,6 +420,7 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+ // around the stream are replaced once the context has resolved, and the stream
+ // itself is left alone.
+ func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sentBy string, paused, continuation bool) {
++	p.djPlayback = nil
+ 	spotCtx := transferState.CurrentSession.Context
+ 	shuffle := transferState.Options.GetShufflingContext()
+ 	current := transferState.Playback.CurrentTrack
+@@ -627,6 +629,7 @@ func abs(v int64) int64 {
+ // cast onto it can start something else straight away. That is why this is not
+ // stopPlayback, which hands a zeroconf session back.
+ func (p *AppPlayer) abandonTransfer() {
++	p.djPlayback = nil
+ 	// Anything still playing belongs to whatever came before the transfer, and
+ 	// is not what the state is about to describe. Stopping it announces itself
+ 	// through the player's stop event.
+@@ -1035,6 +1038,8 @@ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, t
+ 	p.state.player.IsPlaying = true
+ 	p.state.player.IsBuffering = false
+ 	p.state.setPaused(paused) // update IsPaused and PlaybackSpeed
++	p.markDJLoaded(uri)
++	p.commitDJCursor()
+ 	p.updateState()
+ 	p.schedulePrefetchNext()
+ 
+@@ -1237,6 +1242,7 @@ func (p *AppPlayer) play() error {
+ 	p.state.player.Timestamp = time.Now().UnixMilli()
+ 	p.state.player.PositionAsOfTimestamp = streamPos
+ 	p.state.setPaused(false)
++	p.commitDJCursor()
+ 	p.updateState()
+ 	p.schedulePrefetchNext()
+ 
+@@ -1665,6 +1671,7 @@ func (p *AppPlayer) volumeUpdated() {
+ }
+ 
+ func (p *AppPlayer) stopPlayback() {
++	p.djPlayback = nil
+ 	// Whatever is being loaded is not wanted any more. Cancel it, and make
+ 	// sure a result that lands anyway is thrown away rather than published
+ 	// over the inactive state below; the events the player raised for it go
+diff --git a/daemon/dj_context.go b/daemon/dj_context.go
+new file mode 100644
+index 0000000..ff905d3
+--- /dev/null
++++ b/daemon/dj_context.go
+@@ -0,0 +1,262 @@
++package daemon
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"net/url"
++	"path"
++	"strings"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++	"google.golang.org/protobuf/proto"
++)
++
++const djContextURI = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq"
++
++type playContextResolver interface {
++	ContextResolve(context.Context, string) (*connectpb.Context, error)
++	ContextResolveUrl(context.Context, string) (*connectpb.Context, error)
++	ContextPage(context.Context, string) (*connectpb.ContextPage, error)
++}
++
++// DJ's playlist is a session entry point, not an ordinary playlist: resolving
++// it as a playlist yields an empty context. The session provider supplies the
++// narration, tracks and continuation URLs used by the existing DJ player.
++// Request an interactive load rather than restoring the previous session.
++func resolvePlayContext(ctx context.Context, resolver playContextResolver, uri string) (*connectpb.Context, error) {
++	if uri == djContextURI {
++		spotCtx, err := resolver.ContextResolveUrl(ctx,
++			"hm://lexicon-session-provider/context-resolve/v2/session?contextUri="+uri+"&reason=interactive")
++		if err != nil {
++			return nil, err
++		}
++		if spotCtx == nil || spotCtx.Uri != djContextURI {
++			return nil, errors.New("DJ session response is empty")
++		}
++		if spotCtx.Loading {
++			return nil, errors.New("DJ session is still loading; try again")
++		}
++		return spotCtx, nil
++	}
++	return resolver.ContextResolve(ctx, uri)
++}
++
++// Accept only Spotify's DJ pagination service, never arbitrary cached URLs.
++// Keeping the original URL preserves server-issued query parameters verbatim.
++func validDJPageURL(raw string) bool {
++	if len(raw) == 0 || len(raw) > 16384 {
++		return false
++	}
++	u, err := url.Parse(raw)
++	if err != nil || u.Scheme != "hm" || u.Host != "lexicon-session-provider" || u.User != nil ||
++		u.Fragment != "" || u.Opaque != "" || u.RawPath != "" || path.Clean(u.Path) != u.Path ||
++		!strings.HasPrefix(u.Path, "/context-resolve/v2/session/") || strings.HasSuffix(u.Path, "/") {
++		return false
++	}
++	query, err := url.ParseQuery(u.RawQuery)
++	return err == nil && len(query["contextUri"]) == 1 && query.Get("contextUri") == djContextURI
++}
++
++func validDJPage(page *connectpb.ContextPage) bool {
++	if page == nil || len(page.Tracks) == 0 || !validDJPageURL(page.NextPageUrl) {
++		return false
++	}
++	for _, track := range page.Tracks {
++		if track == nil || track.Uri == "" && len(track.Gid) == 0 {
++			return false
++		}
++	}
++	return true
++}
++
++// Combine the returned correlation-id with opening track order to recognize
++// an unchanged root. Exclude dynamic metadata such as current time,
++// pagination state and occurrence UIDs, which need not identify a generation.
++func djRootFingerprint(root *connectpb.Context) string {
++	correlationID := root.Metadata["correlation-id"]
++	if correlationID == "" {
++		correlationID = root.Pages[0].Metadata["correlation-id"]
++	}
++	identity := struct {
++		CorrelationID string
++		Tracks        []string
++	}{CorrelationID: correlationID}
++	for _, track := range root.Pages[0].Tracks {
++		identity.Tracks = append(identity.Tracks, track.Uri+":"+hex.EncodeToString(track.Gid))
++	}
++	encoded, _ := json.Marshal(identity)
++	fingerprint := sha256.Sum256(encoded)
++	return hex.EncodeToString(fingerprint[:])
++}
++
++type djPageError struct{ cause error }
++
++func (err djPageError) Error() string { return "could not fetch the next Spotify DJ set; retry later" }
++func (err djPageError) Unwrap() error { return err.cause }
++
++// Spotify can return a lazy opening or continuation: an empty page carrying
++// the server URL of its tracks. Follow a bounded number of those pointers,
++// preserving their query verbatim and rejecting loops or other services.
++func materializeDJPage(ctx context.Context, resolver playContextResolver, page *connectpb.ContextPage) (*connectpb.ContextPage, error) {
++	visited := make(map[string]bool)
++	for follows := 0; page != nil && len(page.Tracks) == 0; follows++ {
++		if follows >= 3 {
++			return nil, errors.New("Spotify DJ returned too many empty pages; retry later")
++		}
++		next := page.PageUrl
++		if next == "" || visited[next] {
++			next = page.NextPageUrl
++		}
++		if !validDJPageURL(next) || visited[next] {
++			return nil, errors.New("Spotify DJ returned an invalid page continuation")
++		}
++		visited[next] = true
++		var err error
++		page, err = resolver.ContextPage(ctx, next)
++		if err != nil {
++			return nil, djPageError{cause: err}
++		}
++	}
++	if !validDJPage(page) || visited[page.NextPageUrl] {
++		return nil, errors.New("Spotify DJ returned an invalid next set; retry later")
++	}
++	return page, nil
++}
++
++// resolveDJStart advances an unchanged Spotify root to its saved next set.
++// Nothing is persisted here: resolving or prefetching is not playing.
++func resolveDJStart(ctx context.Context, resolver playContextResolver, uri string, saved *librespot.DJCursor) (*connectpb.Context, string, error) {
++	if uri != djContextURI {
++		resolved, err := resolvePlayContext(ctx, resolver, uri)
++		return resolved, "", err
++	}
++	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
++	defer cancel()
++	root, err := resolvePlayContext(ctx, resolver, uri)
++	if err != nil {
++		return nil, "", err
++	}
++	if len(root.Pages) == 0 {
++		return nil, "", errors.New("Spotify DJ returned an invalid starting set")
++	}
++	opening, err := materializeDJPage(ctx, resolver, root.Pages[0])
++	if err != nil {
++		return nil, "", err
++	}
++	root = proto.Clone(root).(*connectpb.Context)
++	root.Pages[0] = opening
++	if root.Metadata == nil {
++		root.Metadata = make(map[string]string)
++	}
++	// A lazy root carries welcome metadata, while its resolved page supplies
++	// the selection's correlation ID and colors. Keep both, preferring root
++	// keys when Spotify already supplied them there.
++	for key, value := range opening.Metadata {
++		if _, exists := root.Metadata[key]; !exists {
++			root.Metadata[key] = value
++		}
++	}
++	fingerprint := djRootFingerprint(root)
++	if saved == nil || saved.RootFingerprint != fingerprint {
++		return root, fingerprint, nil
++	}
++	if !validDJPageURL(saved.NextPageURL) {
++		return nil, "", errors.New("saved Spotify DJ continuation is unavailable; wait for a new Spotify selection")
++	}
++	page, err := materializeDJPage(ctx, resolver, &connectpb.ContextPage{NextPageUrl: saved.NextPageURL})
++	if err != nil {
++		return nil, "", err
++	}
++	resolved := proto.Clone(root).(*connectpb.Context)
++	resolved.Pages = []*connectpb.ContextPage{page}
++	return resolved, fingerprint, nil
++}
++
++type djPlayback struct {
++	username        string
++	rootFingerprint string
++	pending         *djPagePosition
++	loaded          *djPagePosition
++}
++
++type djPagePosition struct {
++	nextPageURL string
++	trackURI    string
++	trackUID    string
++}
++
++func (app *App) djCursor(username string) *librespot.DJCursor {
++	app.stateMu.Lock()
++	defer app.stateMu.Unlock()
++	if app.state == nil {
++		return nil
++	}
++	app.state.Lock()
++	defer app.state.Unlock()
++	cursor, exists := app.state.DJCursors[username]
++	if !exists {
++		return nil
++	}
++	return &cursor
++}
++
++func (app *App) updateDJCursor(username string, cursor librespot.DJCursor) bool {
++	app.stateMu.Lock()
++	defer app.stateMu.Unlock()
++	if app.state == nil || username == "" {
++		return false
++	}
++	app.state.Lock()
++	defer app.state.Unlock()
++	if app.state.DJCursors == nil {
++		app.state.DJCursors = make(map[string]librespot.DJCursor)
++	}
++	if app.state.DJCursors[username] == cursor {
++		return false
++	}
++	app.state.DJCursors[username] = cursor
++	return true
++}
++
++func (p *AppPlayer) rememberDJPage(snap *tracks.Snapshot) {
++	if p.djPlayback == nil {
++		return
++	}
++	track := snap.Current
++	p.djPlayback.pending = nil
++	if snap.HasPageContinuation && track != nil && validDJPageURL(snap.PageNextURL) {
++		p.djPlayback.pending = &djPagePosition{nextPageURL: snap.PageNextURL, trackURI: track.Uri, trackUID: track.Uid}
++	}
++}
++
++func (p *AppPlayer) markDJLoaded(uri string) {
++	if p.djPlayback == nil {
++		return
++	}
++	p.djPlayback.loaded = nil
++	position := p.djPlayback.pending
++	if position != nil && position.trackURI == uri && position.trackUID == p.state.player.Track.GetUid() {
++		copy := *position
++		p.djPlayback.loaded = &copy
++	}
++}
++
++// Called only after a successful unpaused load or successful resume. Failed
++// loads, queued tracks and snapshots built for prefetch never consume a set.
++func (p *AppPlayer) commitDJCursor() {
++	dj := p.djPlayback
++	if dj == nil || dj.loaded == nil || p.state.player.ContextUri != djContextURI || p.state.player.IsPaused {
++		return
++	}
++	if p.app.updateDJCursor(dj.username, librespot.DJCursor{
++		RootFingerprint: dj.rootFingerprint, NextPageURL: dj.loaded.nextPageURL,
++	}) {
++		p.app.requestPersist()
++	}
++}
+diff --git a/daemon/dj_context_test.go b/daemon/dj_context_test.go
+new file mode 100644
+index 0000000..a512d0e
+--- /dev/null
++++ b/daemon/dj_context_test.go
+@@ -0,0 +1,132 @@
++//go:build test_unit
++
++package daemon
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/stretchr/testify/require"
++)
++
++type recordingPlayResolver struct {
++	ctx    context.Context
++	uris   []string
++	urls   []string
++	result *connectpb.Context
++	err    error
++}
++
++func (r *recordingPlayResolver) ContextResolve(ctx context.Context, uri string) (*connectpb.Context, error) {
++	r.ctx = ctx
++	r.uris = append(r.uris, uri)
++	return r.result, r.err
++}
++
++func (r *recordingPlayResolver) ContextResolveUrl(ctx context.Context, url string) (*connectpb.Context, error) {
++	r.ctx = ctx
++	r.urls = append(r.urls, url)
++	return r.result, r.err
++}
++
++func (r *recordingPlayResolver) ContextPage(context.Context, string) (*connectpb.ContextPage, error) {
++	panic("unexpected context page request")
++}
++
++func TestResolvePlayContextDJ(t *testing.T) {
++	want := &connectpb.Context{
++		Uri:      djContextURI,
++		Url:      "hm://lexicon-session-provider/context-resolve/v2/session/test",
++		Metadata: map[string]string{"lexicon_set_type": "your_dj"},
++		Pages: []*connectpb.ContextPage{{
++			NextPageUrl: "hm://lexicon-session-provider/next",
++			Tracks: []*connectpb.ContextTrack{{
++				Uri: "spotify:track:test",
++				Metadata: map[string]string{
++					"narration.intro.ssml": "test intro",
++					"narration.jump.ssml":  "test jump",
++				},
++			}},
++		}},
++	}
++	r := &recordingPlayResolver{result: want}
++	ctx := t.Context()
++	got, err := resolvePlayContext(ctx, r, djContextURI)
++	require.NoError(t, err)
++	require.Same(t, want, got, "preserve session metadata and continuation pages")
++	require.Same(t, ctx, r.ctx)
++	require.Equal(t, []string{"hm://lexicon-session-provider/context-resolve/v2/session?contextUri=" + djContextURI + "&reason=interactive"}, r.urls)
++	require.Empty(t, r.uris)
++}
++
++func TestResolvePlayContextDJNotReady(t *testing.T) {
++	for _, tt := range []struct {
++		name   string
++		result *connectpb.Context
++	}{
++		{name: "empty"},
++		{name: "loading", result: &connectpb.Context{
++			Uri:     djContextURI,
++			Loading: true,
++			// Even a response with usable tracks must not bypass Loading.
++			Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:test"}}}},
++		}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			r := &recordingPlayResolver{result: tt.result}
++			got, err := resolvePlayContext(t.Context(), r, djContextURI)
++			require.Nil(t, got)
++			require.ErrorContains(t, err, tt.name)
++			require.Len(t, r.urls, 1)
++			require.Empty(t, r.uris, "do not fall back to restoring an old session")
++		})
++	}
++}
++
++func TestResolvePlayContextOrdinary(t *testing.T) {
++	for _, uri := range []string{
++		"spotify:playlist:ordinary",
++		"spotify:album:ordinary",
++		"spotify:track:ordinary",
++		djContextURI + "extra",
++	} {
++		t.Run(uri, func(t *testing.T) {
++			want := &connectpb.Context{Uri: uri}
++			r := &recordingPlayResolver{result: want}
++			ctx := t.Context()
++			got, err := resolvePlayContext(ctx, r, uri)
++			require.NoError(t, err)
++			require.Same(t, want, got)
++			require.Same(t, ctx, r.ctx)
++			require.Equal(t, []string{uri}, r.uris)
++			require.Empty(t, r.urls)
++		})
++	}
++}
++
++func TestResolvePlayContextError(t *testing.T) {
++	for _, uri := range []string{djContextURI, "spotify:album:ordinary"} {
++		t.Run(uri, func(t *testing.T) {
++			want := errors.New("session unavailable")
++			r := &recordingPlayResolver{err: want}
++			got, err := resolvePlayContext(t.Context(), r, uri)
++			require.Nil(t, got)
++			require.ErrorIs(t, err, want)
++			require.Equal(t, 1, len(r.uris)+len(r.urls), "do not fall back to an empty DJ playlist")
++		})
++	}
++}
++
++func TestPlayerRootAdvertisesDirectDJBeforeAndAfterReady(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.playbackReadyCh = make(chan struct{})
++	resp, err := p.handleApiRequest(ApiRequest{Type: ApiRequestTypeRoot})
++	require.NoError(t, err)
++	require.Equal(t, &ApiRoot{DirectDj: true}, resp)
++	close(p.playbackReadyCh)
++	resp, err = p.handleApiRequest(ApiRequest{Type: ApiRequestTypeRoot})
++	require.NoError(t, err)
++	require.Equal(t, &ApiRoot{PlaybackReady: true, DirectDj: true}, resp)
++}
+diff --git a/daemon/dj_start_test.go b/daemon/dj_start_test.go
+new file mode 100644
+index 0000000..eda477f
+--- /dev/null
++++ b/daemon/dj_start_test.go
+@@ -0,0 +1,353 @@
++//go:build test_unit
++
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/proto"
++)
++
++func djPageURL(page int) string {
++	return fmt.Sprintf("hm://lexicon-session-provider/context-resolve/v2/session/test?contextUri=%s&previousSegmentId=set%d", djContextURI, page)
++}
++
++func djTestPage(page int) *connectpb.ContextPage {
++	return &connectpb.ContextPage{
++		PageUrl: djPageURL(page), NextPageUrl: djPageURL(page + 1),
++		Tracks: []*connectpb.ContextTrack{{
++			Uri: fmt.Sprintf("spotify:track:track%d", page), Uid: fmt.Sprintf("set%d-occurrence", page),
++			Metadata: map[string]string{"narration.intro.ssml": "server intro", "narration.jump.ssml": "server jump"},
++		}},
++	}
++}
++
++func djTestRoot() *connectpb.Context {
++	return &connectpb.Context{
++		Uri: djContextURI, Url: "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=" + djContextURI,
++		Metadata:     map[string]string{"correlation-id": "root-generation", "lexicon_current_time": "100", "lexicon_set_type": "your_dj"},
++		Restrictions: &connectpb.Restrictions{DisallowTogglingShuffleReasons: []string{"dj"}},
++		Pages:        []*connectpb.ContextPage{djTestPage(0)},
++	}
++}
++
++type djSequenceResolver struct {
++	root      *connectpb.Context
++	pages     map[string]*connectpb.ContextPage
++	requested []string
++	err       error
++	deadline  bool
++}
++
++func (r *djSequenceResolver) ContextResolve(context.Context, string) (*connectpb.Context, error) {
++	return nil, errors.New("unexpected ordinary context resolve")
++}
++
++func (r *djSequenceResolver) ContextResolveUrl(ctx context.Context, raw string) (*connectpb.Context, error) {
++	if !strings.HasSuffix(raw, "&reason=interactive") {
++		return nil, errors.New("missing interactive reason")
++	}
++	_, r.deadline = ctx.Deadline()
++	return r.root, nil
++}
++
++func (r *djSequenceResolver) ContextPage(ctx context.Context, raw string) (*connectpb.ContextPage, error) {
++	r.requested = append(r.requested, raw)
++	if ctx.Err() != nil {
++		return nil, ctx.Err()
++	}
++	if r.err != nil {
++		return nil, r.err
++	}
++	return r.pages[raw], nil
++}
++
++func newDJSequence() *djSequenceResolver {
++	r := &djSequenceResolver{root: djTestRoot(), pages: make(map[string]*connectpb.ContextPage)}
++	for page := 1; page < 6; page++ {
++		r.pages[djPageURL(page)] = djTestPage(page)
++	}
++	return r
++}
++
++func TestDJThreeLaunchesUseConsecutiveServerSets(t *testing.T) {
++	r := newDJSequence()
++	var saved *librespot.DJCursor
++	var originalRoot string
++	for launch := 0; launch < 3; launch++ {
++		resolved, root, err := resolveDJStart(t.Context(), r, djContextURI, saved)
++		require.NoError(t, err)
++		if launch == 0 {
++			originalRoot = root
++		}
++		require.Equal(t, originalRoot, root)
++		require.True(t, r.deadline)
++		require.Equal(t, fmt.Sprintf("spotify:track:track%d", launch), resolved.Pages[0].Tracks[0].Uri)
++		require.Equal(t, "server intro", resolved.Pages[0].Tracks[0].Metadata["narration.intro.ssml"])
++		require.Equal(t, r.root.Metadata, resolved.Metadata)
++		require.True(t, proto.Equal(r.root.Restrictions, resolved.Restrictions))
++		// The owner records this only after the returned page starts playing.
++		saved = &librespot.DJCursor{RootFingerprint: root, NextPageURL: resolved.Pages[0].NextPageUrl}
++	}
++	require.Equal(t, []string{djPageURL(1), djPageURL(2)}, r.requested)
++	require.Equal(t, "spotify:track:track0", r.root.Pages[0].Tracks[0].Uri, "do not mutate the root while selecting a later page")
++}
++
++func TestDJNewRootAndAccountIgnoreOldCursor(t *testing.T) {
++	r := newDJSequence()
++	_, root, err := resolveDJStart(t.Context(), r, djContextURI, nil)
++	require.NoError(t, err)
++	app := &App{state: &librespot.AppState{}}
++	saved := librespot.DJCursor{RootFingerprint: root, NextPageURL: djPageURL(3)}
++	require.True(t, app.updateDJCursor("account-a", saved))
++	require.False(t, app.updateDJCursor("account-a", saved), "save once per current page")
++	require.Nil(t, app.djCursor("account-b"))
++	resolved, _, err := resolveDJStart(t.Context(), r, djContextURI, app.djCursor("account-b"))
++	require.NoError(t, err)
++	require.Equal(t, "spotify:track:track0", resolved.Pages[0].Tracks[0].Uri)
++	r.root.Metadata["correlation-id"] = "new-generation"
++	resolved, newRoot, err := resolveDJStart(t.Context(), r, djContextURI, app.djCursor("account-a"))
++	require.NoError(t, err)
++	require.NotEqual(t, root, newRoot)
++	require.Equal(t, "spotify:track:track0", resolved.Pages[0].Tracks[0].Uri)
++	require.Empty(t, r.requested)
++	require.Equal(t, &saved, app.djCursor("account-a"), "resolution alone must not change persisted state")
++}
++
++func TestDJFingerprintIgnoresClockAndUIDButDetectsOpeningChange(t *testing.T) {
++	root := djTestRoot()
++	fingerprint := djRootFingerprint(root)
++	root.Metadata["lexicon_current_time"] = "999"
++	root.Pages[0].Tracks[0].Uid = "different-occurrence"
++	require.Equal(t, fingerprint, djRootFingerprint(root))
++	root.Pages[0].Tracks[0].Uri = "spotify:track:changed"
++	require.NotEqual(t, fingerprint, djRootFingerprint(root))
++}
++
++func TestDJLazyRootAndPopulatedRootShareCursorIdentity(t *testing.T) {
++	r := newDJSequence()
++	r.root.Metadata = map[string]string{"narration.welcome.ssml": "server welcome"}
++	r.root.Pages = []*connectpb.ContextPage{{NextPageUrl: djPageURL(0)}}
++	firstPage := djTestPage(0)
++	firstPage.Metadata = map[string]string{"correlation-id": "root-generation", "color": "blue"}
++	r.pages[djPageURL(0)] = firstPage
++	resolved, root, err := resolveDJStart(t.Context(), r, djContextURI, nil)
++	require.NoError(t, err)
++	require.Equal(t, "server welcome", resolved.Metadata["narration.welcome.ssml"])
++	require.Equal(t, "root-generation", resolved.Metadata["correlation-id"])
++	require.Equal(t, "blue", resolved.Pages[0].Metadata["color"])
++	require.Equal(t, "server intro", resolved.Pages[0].Tracks[0].Metadata["narration.intro.ssml"])
++	saved := &librespot.DJCursor{RootFingerprint: root, NextPageURL: resolved.Pages[0].NextPageUrl}
++	r.root = djTestRoot() // Spotify now returns the same opening directly.
++	resolved, nextRoot, err := resolveDJStart(t.Context(), r, djContextURI, saved)
++	require.NoError(t, err)
++	require.Equal(t, root, nextRoot)
++	require.Equal(t, "spotify:track:track1", resolved.Pages[0].Tracks[0].Uri)
++	require.Equal(t, []string{djPageURL(0), djPageURL(1)}, r.requested)
++}
++
++func TestDJLazyPagesAreBoundedAndCycleChecked(t *testing.T) {
++	for _, cycle := range []bool{false, true} {
++		r := newDJSequence()
++		r.root.Pages = []*connectpb.ContextPage{{NextPageUrl: djPageURL(0)}}
++		for page := 0; page < 4; page++ {
++			next := page + 1
++			if cycle {
++				next = 0
++			}
++			r.pages[djPageURL(page)] = &connectpb.ContextPage{PageUrl: djPageURL(page), NextPageUrl: djPageURL(next)}
++		}
++		resolved, _, err := resolveDJStart(t.Context(), r, djContextURI, nil)
++		require.Error(t, err)
++		require.Nil(t, resolved)
++		require.LessOrEqual(t, len(r.requested), 3)
++	}
++}
++
++func TestDJContinuationFailureNeverFallsBackOrLeaksURL(t *testing.T) {
++	r := newDJSequence()
++	saved := &librespot.DJCursor{RootFingerprint: djRootFingerprint(r.root), NextPageURL: djPageURL(1)}
++	want := errors.New("failed GET " + saved.NextPageURL)
++	r.err = want
++	resolved, _, err := resolveDJStart(t.Context(), r, djContextURI, saved)
++	require.Nil(t, resolved)
++	require.ErrorIs(t, err, want)
++	require.NotContains(t, err.Error(), saved.NextPageURL)
++	require.Equal(t, djPageURL(1), saved.NextPageURL)
++	require.Len(t, r.requested, 1)
++}
++
++func TestDJContinuationRespectsCancellation(t *testing.T) {
++	r := newDJSequence()
++	ctx, cancel := context.WithCancel(t.Context())
++	cancel()
++	_, _, err := resolveDJStart(ctx, r, djContextURI, &librespot.DJCursor{RootFingerprint: djRootFingerprint(r.root), NextPageURL: djPageURL(1)})
++	require.ErrorIs(t, err, context.Canceled)
++}
++
++func TestDJRejectsMalformedRootAndPage(t *testing.T) {
++	for _, invalid := range []*connectpb.Context{nil, {}, {Uri: "spotify:album:other"}, {Uri: djContextURI},
++		{Uri: djContextURI, Loading: true, Pages: []*connectpb.ContextPage{djTestPage(0)}},
++		{Uri: djContextURI, Pages: []*connectpb.ContextPage{nil}},
++		{Uri: djContextURI, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:x"}}}}},
++	} {
++		r := newDJSequence()
++		r.root = invalid
++		resolved, _, err := resolveDJStart(t.Context(), r, djContextURI, nil)
++		require.Error(t, err)
++		require.Nil(t, resolved)
++	}
++	for _, invalid := range []*connectpb.ContextPage{nil, {}, {NextPageUrl: "https://untrusted.invalid/page"},
++		{NextPageUrl: djPageURL(2), Tracks: []*connectpb.ContextTrack{nil}},
++		{NextPageUrl: djPageURL(1), Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:x"}}},
++	} {
++		r := newDJSequence()
++		r.pages[djPageURL(1)] = invalid
++		resolved, _, err := resolveDJStart(t.Context(), r, djContextURI, &librespot.DJCursor{RootFingerprint: djRootFingerprint(r.root), NextPageURL: djPageURL(1)})
++		require.Error(t, err)
++		require.Nil(t, resolved)
++	}
++}
++
++func TestDJRejectsUntrustedContinuationBeforeRequest(t *testing.T) {
++	for _, raw := range []string{"", "https://example.com/private", "hm://evil/context-resolve/v2/session/id?contextUri=" + djContextURI,
++		"hm://user@lexicon-session-provider/context-resolve/v2/session/id?contextUri=" + djContextURI,
++		djPageURL(1) + "#fragment", strings.Replace(djPageURL(1), "/session/test", "/session/../other", 1),
++		strings.Replace(djPageURL(1), "contextUri="+djContextURI, "contextUri=spotify:playlist:other", 1),
++	} {
++		r := newDJSequence()
++		_, _, err := resolveDJStart(t.Context(), r, djContextURI, &librespot.DJCursor{RootFingerprint: djRootFingerprint(r.root), NextPageURL: raw})
++		require.Error(t, err)
++		require.Empty(t, r.requested)
++	}
++}
++
++type djMemoryStore struct {
++	mu   sync.Mutex
++	data []byte
++}
++
++func (s *djMemoryStore) Load() (*librespot.AppState, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	state := &librespot.AppState{}
++	if len(s.data) == 0 {
++		return state, nil
++	}
++	return state, json.Unmarshal(s.data, state)
++}
++func (s *djMemoryStore) Save(state *librespot.AppState) error {
++	state.Lock()
++	defer state.Unlock()
++	data, err := json.Marshal(state)
++	if err != nil {
++		return err
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.data = data
++	return nil
++}
++
++func TestDJOnlyLoadedUnpausedPageAdvancesAndCloseFlushes(t *testing.T) {
++	p := newTestAppPlayer(t)
++	store := &djMemoryStore{}
++	p.app.state = &librespot.AppState{}
++	p.app.stateStore = store
++	p.djPlayback = &djPlayback{username: "account-a", rootFingerprint: "root"}
++	p.state.player.ContextUri = djContextURI
++	setPage := func(page int) {
++		track := &connectpb.ProvidedTrack{Uri: fmt.Sprintf("spotify:track:track%d", page), Uid: fmt.Sprintf("set%d", page)}
++		p.state.player.Track = track
++		p.rememberDJPage(&tracks.Snapshot{Current: track, HasPageContinuation: true, PageNextURL: djPageURL(page + 1)})
++	}
++	setPage(0)
++	p.commitDJCursor()
++	require.Nil(t, p.app.djCursor("account-a"), "prefetch/snapshot is not a successful load")
++	p.markDJLoaded(p.state.player.Track.Uri)
++	p.state.setPaused(true)
++	p.commitDJCursor()
++	require.Nil(t, p.app.djCursor("account-a"), "a paused-only load has not played")
++	p.state.setPaused(false)
++	p.commitDJCursor()
++	require.Equal(t, djPageURL(1), p.app.djCursor("account-a").NextPageURL)
++	setPage(2) // page 2 is selected, but its load fails; page 0 remains loaded.
++	p.commitDJCursor()
++	require.Equal(t, djPageURL(1), p.app.djCursor("account-a").NextPageURL)
++	p.markDJLoaded(p.state.player.Track.Uri) // later, page 2 really loads.
++	p.commitDJCursor()
++	require.Equal(t, djPageURL(3), p.app.djCursor("account-a").NextPageURL)
++	p.rememberDJPage(&tracks.Snapshot{Current: &connectpb.ProvidedTrack{Uri: "spotify:track:queued"}})
++	p.markDJLoaded("spotify:track:queued")
++	p.commitDJCursor()
++	require.Equal(t, djPageURL(3), p.app.djCursor("account-a").NextPageURL, "queued/injected track is not a DJ page")
++	// No sleep: shutdown itself must flush the latest bookmark.
++	require.NoError(t, p.app.Close())
++	state, err := store.Load()
++	require.NoError(t, err)
++	require.Equal(t, djPageURL(3), state.DJCursors["account-a"].NextPageURL)
++	require.Eventually(t, func() bool { p.app.stateMu.Lock(); defer p.app.stateMu.Unlock(); return !p.app.saving }, time.Second, time.Millisecond)
++}
++
++type djBlockingStore struct {
++	entered chan struct{}
++	release chan struct{}
++	once    sync.Once
++}
++
++func (s *djBlockingStore) Load() (*librespot.AppState, error) { return &librespot.AppState{}, nil }
++func (s *djBlockingStore) Save(*librespot.AppState) error {
++	s.once.Do(func() { close(s.entered) })
++	<-s.release
++	return nil
++}
++
++func TestDJConcurrentCloseWaitsForStateFlush(t *testing.T) {
++	store := &djBlockingStore{entered: make(chan struct{}), release: make(chan struct{})}
++	app := &App{state: &librespot.AppState{}, stateStore: store}
++	first, second := make(chan error, 1), make(chan error, 1)
++	go func() { first <- app.Close() }()
++	select {
++	case <-store.entered:
++	case <-time.After(time.Second):
++		t.Fatal("first close did not enter the state flush")
++	}
++	go func() { second <- app.Close() }()
++	select {
++	case <-second:
++		t.Fatal("concurrent close returned before the state was saved")
++	case <-time.After(20 * time.Millisecond):
++	}
++	close(store.release)
++	for _, done := range []chan error{first, second} {
++		select {
++		case err := <-done:
++			require.NoError(t, err)
++		case <-time.After(time.Second):
++			t.Fatal("close did not finish after the state was saved")
++		}
++	}
++}
++
++func TestDJFinalCloseFlushesAfterEarlyResourceClose(t *testing.T) {
++	store := &djMemoryStore{}
++	app := &App{state: &librespot.AppState{}, stateStore: store}
++	require.NoError(t, app.Close()) // cancellation goroutine closes early
++	cursor := librespot.DJCursor{RootFingerprint: "root", NextPageURL: djPageURL(3)}
++	require.True(t, app.updateDJCursor("account-a", cursor)) // last player commit
++	require.NoError(t, app.Close())                          // command defer runs after player Run returns
++	state, err := store.Load()
++	require.NoError(t, err)
++	require.Equal(t, cursor, state.DJCursors["account-a"])
++}
+diff --git a/daemon/player.go b/daemon/player.go
+index 6d62bc1..cbc2af1 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -54,7 +54,8 @@ type AppPlayer struct {
+ 	initialVolumeOnce sync.Once
+ 	volumeUpdate      chan float32
+ 
+-	loader *loaderLane
++	loader     *loaderLane
++	djPlayback *djPlayback
+ 
+ 	// resolveTrackList builds the track list for a transferred context. Nil
+ 	// means the real one, over the session's spclient: tests stand in for the
+@@ -321,6 +322,7 @@ func (p *AppPlayer) trackListFromContext(ctx context.Context, spotCtx *connectpb
+ // hands over: its id, options, origin and context. The tracks and the playback
+ // are the caller's.
+ func (p *AppPlayer) applyTransferSession(transferState *connectpb.TransferState, sentBy string) {
++	p.djPlayback = nil
+ 	if sessId := transferState.CurrentSession.OriginalSessionId; sessId != nil {
+ 		p.state.player.SessionId = *sessId
+ 	} else {
+@@ -649,7 +651,7 @@ func nonEmpty(s string) *string {
+ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 	switch req.Type {
+ 	case ApiRequestTypeRoot:
+-		return &ApiRoot{PlaybackReady: p.playbackReady()}, nil
++		return &ApiRoot{PlaybackReady: p.playbackReady(), DirectDj: true}, nil
+ 	case ApiRequestTypeStatus:
+ 		resp := &ApiStatus{
+ 			Username:           p.sess.Username(),
+@@ -735,6 +737,12 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 		return nil, nil
+ 	case ApiRequestTypePlay:
+ 		data := req.Data.(ApiPlay)
++		var djAccount string
++		var djSaved *librespot.DJCursor
++		if data.Uri == djContextURI {
++			djAccount = p.sess.Username()
++			djSaved = p.app.djCursor(djAccount)
++		}
+ 
+ 		var skipTo skipToFunc
+ 		if len(data.SkipToUri) > 0 {
+@@ -767,7 +775,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 			gen:   p.loadGen,
+ 			reply: apiReply(req),
+ 			run: func(ctx context.Context) loaderResult {
+-				spotCtx, err := p.sess.Spclient().ContextResolve(ctx, data.Uri)
++				spotCtx, djRoot, err := resolveDJStart(ctx, p.sess.Spclient(), data.Uri, djSaved)
+ 				if err != nil {
+ 					return loaderResult{err: fmt.Errorf("failed resolving context: %w", err)}
+ 				}
+@@ -804,6 +812,9 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 							}
+ 						}
+ 					})
++					if djRoot != "" {
++						p.djPlayback = &djPlayback{username: djAccount, rootFingerprint: djRoot}
++					}
+ 				}}
+ 			},
+ 		})
+diff --git a/daemon/player_state.go b/daemon/player_state.go
+index 7de1519..34165c7 100644
+--- a/daemon/player_state.go
++++ b/daemon/player_state.go
+@@ -257,6 +257,7 @@ func (p *AppPlayer) clearUpcoming() {
+ // publishSnapshot reports where the track list now stands: what is playing and
+ // what surrounds it.
+ func (p *AppPlayer) publishSnapshot(snap *tracks.Snapshot) {
++	p.rememberDJPage(snap)
+ 	p.state.player.Track = snap.Current
+ 	p.state.player.Index = snap.Index
+ 	p.publishUpcoming(snap)
+diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
+index 9a2220b..b20bece 100644
+--- a/spclient/context_resolver.go
++++ b/spclient/context_resolver.go
+@@ -151,6 +151,15 @@ func (r *ContextResolver) loadPage(ctx context.Context, url string) (*connectpb.
+ 	return &contextPage, nil
+ }
+ 
++// PageNextURL reads a resident page only. Fetching future pages must not move
++// the playback cursor recorded by the owner of a track list.
++func (r *ContextResolver) PageNextURL(idx int) (string, bool) {
++	if idx < 0 || idx >= len(r.ctx.Pages) || r.ctx.Pages[idx] == nil {
++		return "", false
++	}
++	return r.ctx.Pages[idx].NextPageUrl, true
++}
++
+ func (r *ContextResolver) Page(ctx context.Context, idx int) ([]*connectpb.ContextTrack, error) {
+ 	for idx >= len(r.ctx.Pages) {
+ 		lastPage := r.ctx.Pages[len(r.ctx.Pages)-1]
+diff --git a/spclient/spclient.go b/spclient/spclient.go
+index db03595..99b681d 100644
+--- a/spclient/spclient.go
++++ b/spclient/spclient.go
+@@ -556,6 +556,23 @@ func (c *Spclient) ContextResolveUrl(ctx context.Context, hmUrl string) (*connec
+ 	return &context, nil
+ }
+ 
++// ContextPage decodes a server-issued pagination URL as a page, not a Context.
++func (c *Spclient) ContextPage(ctx context.Context, hmURL string) (*connectpb.ContextPage, error) {
++	resp, err := c.RequestHm(ctx, "GET", hmURL, nil, nil)
++	if err != nil {
++		return nil, err
++	}
++	defer func() { _ = resp.Body.Close() }()
++	if resp.StatusCode != http.StatusOK {
++		return nil, &ContextResolveError{StatusCode: resp.StatusCode}
++	}
++	var page connectpb.ContextPage
++	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&page); err != nil {
++		return nil, fmt.Errorf("failed decoding context page: %w", err)
++	}
++	return &page, nil
++}
++
+ func (c *Spclient) ContextResolveAutoplay(ctx context.Context, reqProto *playerpb.AutoplayContextRequest) (*connectpb.Context, error) {
+ 	reqBody, err := proto.Marshal(reqProto)
+ 	if err != nil {
+diff --git a/state.go b/state.go
+index 2f02c19..c9271d5 100644
+--- a/state.go
++++ b/state.go
+@@ -19,5 +19,13 @@ type AppState struct {
+ 		Username string `json:"username"`
+ 		Data     []byte `json:"data"`
+ 	} `json:"credentials"`
+-	LastVolume *uint32 `json:"last_volume"`
++	LastVolume *uint32             `json:"last_volume"`
++	DJCursors  map[string]DJCursor `json:"dj_cursors,omitempty"`
++}
++
++// DJCursor belongs to one account and one Spotify-generated root sequence.
++// It advances only when a track from its page successfully starts playing.
++type DJCursor struct {
++	RootFingerprint string `json:"root_fingerprint"`
++	NextPageURL     string `json:"next_page_url"`
+ }
+diff --git a/tracks/dj_cursor_test.go b/tracks/dj_cursor_test.go
+new file mode 100644
+index 0000000..5ecec85
+--- /dev/null
++++ b/tracks/dj_cursor_test.go
+@@ -0,0 +1,162 @@
++//go:build test_unit
++
++package tracks
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++)
++
++// Each page models one five-track DJ set. The first song recurs in every set,
++// so its URI alone cannot identify the page that the listener has reached.
++type djCursorResolver struct {
++	pages    [][]*connectpb.ContextTrack
++	loaded   map[int]bool
++	furthest int
++}
++
++func newDJCursorResolver() *djCursorResolver {
++	r := &djCursorResolver{loaded: make(map[int]bool), furthest: -1}
++	for page := range 12 {
++		var tracks []*connectpb.ContextTrack
++		for item := range 5 {
++			id := page*5 + item + 1
++			if item == 0 {
++				id = 1
++			}
++			tracks = append(tracks, &connectpb.ContextTrack{
++				Uri: fmt.Sprintf("spotify:track:%022d", id),
++				Uid: fmt.Sprintf("set-%d-track-%d", page, item),
++			})
++		}
++		r.pages = append(r.pages, tracks)
++	}
++	return r
++}
++
++func (*djCursorResolver) Type() librespot.SpotifyIdType { return librespot.SpotifyIdTypeTrack }
++func (*djCursorResolver) Uri() string {
++	return "spotify:playlist:37i9dQZF1EYkqdzj48dyYq"
++}
++func (*djCursorResolver) Metadata() map[string]string { return nil }
++
++func (r *djCursorResolver) Page(_ context.Context, index int) ([]*connectpb.ContextTrack, error) {
++	if index < 0 || index >= len(r.pages) {
++		return nil, io.EOF
++	}
++	r.loaded[index] = true
++	r.furthest = max(r.furthest, index)
++	return r.pages[index], nil
++}
++
++func djCursorForPage(page int) string {
++	return fmt.Sprintf("hm://lexicon-session-provider/context-resolve/v2/session/test?previousSegmentId=set-%d", page)
++}
++
++func (r *djCursorResolver) PageNextURL(index int) (string, bool) {
++	if !r.loaded[index] {
++		return "", false
++	}
++	return djCursorForPage(index), true
++}
++
++func newDJCursorList(t *testing.T) (*List, *djCursorResolver) {
++	t.Helper()
++	r := newDJCursorResolver()
++	list := newTrackList(&librespot.NullLogger{}, r)
++	if !list.GoStart(t.Context()) {
++		t.Fatal("could not start the first DJ set")
++	}
++	return list, r
++}
++
++func TestDJCursorSnapshotUsesCurrentPageDespiteLookahead(t *testing.T) {
++	list, resolver := newDJCursorList(t)
++	for attempt := range 2 {
++		snap := list.Snapshot(t.Context(), nil)
++		if resolver.furthest <= 0 {
++			t.Fatal("test did not fetch future pages while building the upcoming window")
++		}
++		if !snap.HasPageContinuation || snap.PageNextURL != djCursorForPage(0) {
++			t.Fatalf("snapshot %d bookmarked prefetched pages: continuation=%t, URL=%q", attempt, snap.HasPageContinuation, snap.PageNextURL)
++		}
++		if snap.Current.Uid != "set-0-track-0" || snap.Index.Page != 0 {
++			t.Fatalf("lookahead moved the playing track: %v", snap.Current)
++		}
++	}
++}
++
++func TestDJCursorFollowsCurrentPageAfterSeveralSets(t *testing.T) {
++	list, resolver := newDJCursorList(t)
++	firstURI := list.CurrentTrack().Uri
++	if err := list.Seek(t.Context(), func(track *connectpb.ContextTrack) bool {
++		return track.Uid == "set-3-track-0"
++	}); err != nil {
++		t.Fatal(err)
++	}
++	snap := list.Snapshot(t.Context(), nil)
++	if snap.Current.Uri != firstURI {
++		t.Fatal("test must use repeated songs with distinct occurrences")
++	}
++	if resolver.furthest <= 3 {
++		t.Fatal("test did not prefetch beyond the current set")
++	}
++	if !snap.HasPageContinuation || snap.PageNextURL != djCursorForPage(3) {
++		t.Fatalf("later set has wrong continuation: %t, %q", snap.HasPageContinuation, snap.PageNextURL)
++	}
++
++	// Going back to an earlier set must describe that actual page, rather
++	// than the highest page visited or fetched during the session.
++	if !list.GoPrev() {
++		t.Fatal("could not move to the previous set")
++	}
++	snap = list.Snapshot(t.Context(), nil)
++	if snap.Current.Uid != "set-2-track-4" || !snap.HasPageContinuation || snap.PageNextURL != djCursorForPage(2) {
++		t.Fatalf("previous set has wrong continuation: track=%v, continuation=%t, URL=%q", snap.Current, snap.HasPageContinuation, snap.PageNextURL)
++	}
++}
++
++func TestDJCursorExcludesTracksOutsideContextPages(t *testing.T) {
++	for _, kind := range []string{"queued", "injected"} {
++		t.Run(kind, func(t *testing.T) {
++			list, _ := newDJCursorList(t)
++			if kind == "queued" {
++				// Even a queued copy of a song in the current DJ set is not a
++				// new position in that set.
++				list.AddToQueue(&connectpb.ContextTrack{Uri: list.CurrentTrack().Uri, Uid: "queued-copy"})
++				if !list.GoNext(t.Context()) {
++					t.Fatal("could not play the queued track")
++				}
++			} else if err := list.TrySeekTo(t.Context(), &connectpb.ContextTrack{
++				Uri: "spotify:track:0000000000000000009999", Uid: "injected-track",
++			}); err != nil {
++				t.Fatal(err)
++			}
++			snap := list.Snapshot(t.Context(), nil)
++			if snap.HasPageContinuation || snap.PageNextURL != "" {
++				t.Fatalf("%s track was treated as a played context page: %t, %q", kind, snap.HasPageContinuation, snap.PageNextURL)
++			}
++			if snap.Index.Page != 0 || snap.Index.Track != 0 {
++				t.Fatal("test must cover the ambiguous zero context index")
++			}
++		})
++	}
++}
++
++func TestDJCursorIsOptionalForOtherResolvers(t *testing.T) {
++	// Hide the optional method, preserving the original resolver contract.
++	resolver := struct{ ContextResolver }{newDJCursorResolver()}
++	list := newTrackList(&librespot.NullLogger{}, resolver)
++	if !list.GoStart(t.Context()) {
++		t.Fatal("could not start the context")
++	}
++	snap := list.Snapshot(t.Context(), nil)
++	if snap.HasPageContinuation || snap.PageNextURL != "" {
++		t.Fatalf("resolver without page continuation returned a cursor: %t, %q", snap.HasPageContinuation, snap.PageNextURL)
++	}
++}
+diff --git a/tracks/tracks.go b/tracks/tracks.go
+index 9d6180b..2db4c9c 100644
+--- a/tracks/tracks.go
++++ b/tracks/tracks.go
+@@ -191,6 +191,10 @@ type Snapshot struct {
+ 	Prev     []*connectpb.ProvidedTrack
+ 	Next     []*connectpb.ProvidedTrack
+ 	Index    *connectpb.ContextIndex
++	// Internal continuation of the current page, never the last prefetched
++	// page. A queued/injected track is not a position in the context.
++	PageNextURL         string
++	HasPageContinuation bool
+ }
+ 
+ // cloneProvided copies a track away from the list that produced it.
+@@ -216,12 +220,23 @@ func cloneProvidedAll(tracks []*connectpb.ProvidedTrack) []*connectpb.ProvidedTr
+ // non-nil, supplies the upcoming order from a set_queue command; otherwise the
+ // upcoming tracks are walked out of the context, which may fetch pages.
+ func (tl *List) Snapshot(ctx context.Context, nextHint []*connectpb.ContextTrack) *Snapshot {
++	var nextPageURL string
++	var hasPageContinuation bool
++	if !tl.playingQueue && tl.tracks.pos >= 0 {
++		if page := tl.tracks.get().pageIdx; page >= 0 {
++			if resolver, ok := tl.ctx.(interface{ PageNextURL(int) (string, bool) }); ok {
++				nextPageURL, hasPageContinuation = resolver.PageNextURL(page)
++			}
++		}
++	}
+ 	return &Snapshot{
+-		Metadata: maps.Clone(tl.Metadata()),
+-		Current:  cloneProvided(tl.CurrentTrack()),
+-		Prev:     cloneProvidedAll(tl.PrevTracks()),
+-		Next:     cloneProvidedAll(tl.NextTracks(ctx, nextHint)),
+-		Index:    tl.Index(),
++		Metadata:            maps.Clone(tl.Metadata()),
++		Current:             cloneProvided(tl.CurrentTrack()),
++		Prev:                cloneProvidedAll(tl.PrevTracks()),
++		Next:                cloneProvidedAll(tl.NextTracks(ctx, nextHint)),
++		Index:               tl.Index(),
++		PageNextURL:         nextPageURL,
++		HasPageContinuation: hasPageContinuation,
+ 	}
+ }
+ 

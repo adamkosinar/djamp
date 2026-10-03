@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A small terminal front end for an existing go-librespot DJ session."""
+"""A terminal Spotify player that starts DJ X through go-librespot."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ ROOT = Path.home()
 CONFIG = ROOT / ".config/go-librespot"
 LOG = ROOT / ".local/state/djamp/player.log"
 PORT = 3678
+DJ_URI = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq"
 DJ_URL = "https://open.spotify.com/playlist/37i9dQZF1EYkqdzj48dyYq"
 
 
@@ -81,7 +82,10 @@ class API:
 
     def request(self, path, payload=None, *, post=False):
         # A direct loopback connection: never send requests through a proxy.
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        # Context resolution can take longer than a status poll. It runs on the
+        # worker thread, so this bounded wait never blocks terminal input.
+        timeout = 20 if post and path == "/player/play" else 2
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         try:
             data = json.dumps(payload or {}).encode() if post else None
             conn.request("POST" if post else "GET", path, body=data,
@@ -119,9 +123,9 @@ class PlayerProcess:
                 except BlockingIOError:
                     raise RuntimeError("Stop the previous try-spotify-dj with Ctrl+C, then run djamp again.") from None
                 # Closing the handle releases our lock, if acquired.
-        binary = ROOT / ".local/bin/go-librespot"
+        binary = ROOT / ".local/bin/go-librespot-djamp"
         if not binary.is_file():
-            raise RuntimeError("Run ~/.local/bin/try-spotify-dj once to install go-librespot.")
+            raise RuntimeError("DJamp backend missing. Run ./scripts/build-backend from the DJamp checkout.")
         LOG.parent.mkdir(parents=True, exist_ok=True)
         self.output = LOG.open("w")
         LOG.chmod(0o600)
@@ -161,14 +165,19 @@ def playback_position(status, received_at, now=None):
 
 
 class PlayerWorker(threading.Thread):
-    def __init__(self, api):
+    def __init__(self, api, autoplay=True):
         super().__init__(daemon=True)
         self.api = api
         self.stop_event = threading.Event()
         self.commands = queue.Queue(maxsize=32)
         self.lock = threading.Lock()
+        self.autoplay_pending = autoplay
+        self.dj_requested = False
+        self.dj_started_at = None
+        self.previous_track = None
         self.state = {"connected": False, "ready": False, "status": {}, "auth": {},
-                      "received": time.monotonic(), "error": "", "notice": "", "recent": []}
+                      "received": time.monotonic(), "error": "", "notice": "", "recent": [],
+                      "direct_dj": False, "dj_starting": False}
 
     def snapshot(self):
         with self.lock:
@@ -181,19 +190,84 @@ class PlayerWorker(threading.Thread):
             with self.lock:
                 self.state["notice"] = "Waiting for the player to finish previous commands."
 
+    def _notice(self, message, starting=False):
+        with self.lock:
+            self.state.update(notice=message, dj_starting=starting)
+
+    def _process_command(self, path, payload):
+        # A playback choice supersedes startup autoplay. Volume adjustments
+        # should still work without cancelling a queued or loading DJ session.
+        if path != "/player/volume":
+            self.autoplay_pending = False
+            self.dj_started_at = None
+            self.dj_requested = path == "/player/play" and (payload or {}).get("uri") == DJ_URI
+            if self.dj_requested:
+                self._notice("Waiting for Spotify to start DJ X…", starting=True)
+                return
+        try:
+            self.api.request(path, payload, post=True)
+            if not self.dj_requested and self.dj_started_at is None:
+                self._notice("")
+        except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
+            self._notice(clean(exc), starting=self.dj_requested or self.dj_started_at is not None)
+
+    def _start_dj(self, supported):
+        self.dj_requested = False
+        if not supported:
+            self._notice("Close the previous player and restart DJamp to enable DJ startup. b opens Spotify.")
+            return
+        self._notice("Starting DJ X…", starting=True)
+        try:
+            self.api.request("/player/play", {"uri": DJ_URI}, post=True)
+            self.dj_started_at = time.monotonic()
+        except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
+            self._notice("Could not start DJ X: " + clean(exc) + " · Press d to retry.")
+
+    def _poll(self):
+        # This endpoint bypasses the backend's player request queue. During
+        # device pairing that queue cannot answer even the readiness endpoint.
+        auth = self.api.request("/auth/code")
+        if auth.get("code"):
+            with self.lock:
+                self.state.update(connected=True, ready=False, status={}, auth=auth, error="")
+            return
+        root = self.api.request("/")
+        ready = bool(root.get("playback_ready"))
+        status = self.api.request("/status") if ready else {}
+        track = status.get("track") or {}
+        with self.lock:
+            recent = list(self.state["recent"])
+            if track.get("uri") and self.previous_track and track["uri"] != self.previous_track.get("uri"):
+                recent = [self.previous_track] + [t for t in recent if t.get("uri") != self.previous_track.get("uri")]
+            if track.get("uri"):
+                self.previous_track = track
+            self.state.update(connected=True, ready=ready, direct_dj=bool(root.get("direct_dj")),
+                              status=status, auth=auth, received=time.monotonic(), error="",
+                              recent=recent[:40])
+
+        if self.dj_started_at is not None:
+            if status.get("context_uri") == DJ_URI and track and not status.get("stopped") and not status.get("buffering"):
+                self.dj_started_at = None
+                self._notice("")
+            elif time.monotonic() - self.dj_started_at >= 30:
+                self.dj_started_at = None
+                self._notice("DJ X did not start. Press d to retry or b to open Spotify.")
+
+        # Consume this once per launch, even when there is already a session.
+        # A later pause, stop, or reconnect must not unexpectedly restart DJ.
+        if self.autoplay_pending and ready and "stopped" in status:
+            self.autoplay_pending = False
+            if status["stopped"] and not track and not status.get("paused") and not status.get("buffering"):
+                self.dj_requested = True
+        if self.dj_requested and ready and not self.stop_event.is_set():
+            self._start_dj(bool(root.get("direct_dj")))
+
     def run(self):
-        previous_track = None
         next_poll = 0
         while not self.stop_event.is_set():
             try:
                 path, payload = self.commands.get(timeout=max(0, min(0.1, next_poll - time.monotonic())))
-                try:
-                    self.api.request(path, payload, post=True)
-                    with self.lock:
-                        self.state["notice"] = ""
-                except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
-                    with self.lock:
-                        self.state["notice"] = clean(exc)
+                self._process_command(path, payload)
                 next_poll = 0
             except queue.Empty:
                 pass
@@ -201,19 +275,7 @@ class PlayerWorker(threading.Thread):
                 continue
             next_poll = time.monotonic() + 0.5
             try:
-                root = self.api.request("/")
-                status = self.api.request("/status")
-                auth = self.api.request("/auth/code") if not root.get("playback_ready") else {}
-                track = status.get("track") or {}
-                with self.lock:
-                    recent = list(self.state["recent"])
-                    if track.get("uri") and previous_track and track["uri"] != previous_track.get("uri"):
-                        recent = [previous_track] + [t for t in recent if t.get("uri") != previous_track.get("uri")]
-                    if track.get("uri"):
-                        previous_track = track
-                    self.state.update(connected=True, ready=root.get("playback_ready", False),
-                                      status=status, auth=auth, received=time.monotonic(), error="",
-                                      recent=recent[:40])
+                self._poll()
             except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
                 with self.lock:
                     self.state.update(connected=False, error=clean(exc))
@@ -390,6 +452,8 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
         label = "BUFFERING"
     if not connected:
         label = "CONNECTING"
+    elif state.get("dj_starting"):
+        label = "STARTING DJ"
 
     canvas.put(top, left + 1, "D J A M P", "accent", True)
     canvas.put(top, left + 16, "SPOTIFY  /  TERMINAL PLAYER" if width >= 84 else "SPOTIFY", "muted")
@@ -406,8 +470,10 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
         album = track.get("album_name") or context
     elif not ready:
         title, artist, album = "Connecting to Spotify…", "Using your saved Spotify login", "This can take a moment."
+    elif state.get("dj_starting"):
+        title, artist, album = "Starting your DJ…", "Loading your Spotify DJ session", "Your DJ introduction and music will play here."
     else:
-        title, artist, album = "Ready for your DJ", "Select Omarchy DJ in Spotify and start DJ X.", "d opens DJ in Spotify  ·  o plays a Spotify link"
+        title, artist, album = "Ready for your DJ", "Press d to start your next DJ set.", "o plays a Spotify link  ·  b opens Spotify"
     canvas.put(top + 5, left + 3, title, "text", True, width - 6)
     canvas.put(top + 6, left + 3, artist, "cyan", width=width - 6)
     canvas.put(top + 7, left + 3, album, "muted", width=width - 6)
@@ -479,17 +545,17 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
     codec = (track.get("codec") or "").upper()
     bitrate = track.get("bitrate")
     quality = f"{codec} · {bitrate} kbps" if bitrate else codec
-    footer = notice or state.get("notice") or ("Connecting to the player…" if not connected else f"{context}   {quality}")
-    canvas.put(top + height - 3, left + 2, footer, "warm" if notice or state.get("notice") else "muted", width=width - 4)
-    keys = "space play/pause · n/p skip · +/- vol · v view · o link · d DJ · ? help · q quit"
+    footer = notice or state.get("error") or state.get("notice") or ("Connecting to the player…" if not connected else f"{context}   {quality}")
+    canvas.put(top + height - 3, left + 2, footer, "warm" if notice or state.get("error") or state.get("notice") else "muted", width=width - 4)
+    keys = "space play/pause · n/p skip · +/- vol · v view · o link · d DJ set · ? help · q quit"
     if width < 82:
-        keys = "space play · n/p skip · +/- vol · v view · ? help · q quit"
+        keys = "space play · n/p skip · d DJ set · ? help · q quit"
     canvas.put(top + height - 1, left + 1, keys, "cyan", width=width - 2)
     if show_help:
         lines = ["KEYBOARD CONTROLS", "", "Space       Play / pause", "n / p       Next / previous track",
                  "← / →       Seek 10 seconds", "+ / -       Volume up / down", "m           Mute / restore volume",
                  "v           Spectrum / waveform / off", "o           Play a Spotify link or URI",
-                 "d           Open DJ X in Spotify", "q / Ctrl+C  Quit", "", "DJ starts in Spotify; controls stay here.",
+                 "d / D       Start the next DJ set", "b           Open Spotify in browser", "q / Ctrl+C  Quit", "", "DJ starts automatically when idle.",
                  "The visualizer follows your audio output.", "", "Press ? or Esc to close"]
         box_w = min(width - 2, 54)
         box_x, box_y = (screen_w - box_w) // 2, (screen_h - len(lines) - 2) // 2
@@ -500,12 +566,12 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
             canvas.put(box_y + 1 + i, box_x + 3, line, "accent" if i == 0 else "text", width=box_w - 6)
 
 
-def prompt_link(window, colors):
+def prompt_link(window, colors, should_stop=lambda: False):
     value = ""
     window.timeout(100)
     try:
         curses.curs_set(1)
-        while True:
+        while not should_stop():
             height, width = window.getmaxyx()
             window.move(max(0, height - 2), 0)
             window.clrtoeol()
@@ -525,22 +591,24 @@ def prompt_link(window, colors):
                 value = value[:-1]
             elif isinstance(key, str) and key.isprintable() and len(value) < 1000:
                 value += key
+        return ""
     finally:
         curses.curs_set(0)
         window.timeout(50)
 
 
-def demo_state(start, paused=False, volume=65):
-    elapsed = time.monotonic() - start
+def demo_state(start, paused=False, volume=65, paused_at=None):
+    now = time.monotonic()
+    elapsed = (paused_at if paused_at is not None else now) - start
     track = {"uri": "spotify:track:" + "0" * 22, "name": "Midnight City", "artist_names": ["M83"],
              "album_name": "Hurry Up, We're Dreaming", "position": int(elapsed * 1000) % 243000,
              "duration": 243000, "codec": "vorbis", "bitrate": 320}
-    return {"connected": True, "ready": True, "received": time.monotonic(), "recent": [],
+    return {"connected": True, "ready": True, "received": now, "recent": [],
             "status": {"paused": paused, "stopped": False, "context_name": "DJ X", "volume": volume,
                        "volume_steps": 100, "track": track, "next_track": {"name": "Your next discovery"}}}
 
 
-def run_ui(window, worker, monitor, player, demo=False):
+def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: False):
     curses.curs_set(0)
     window.keypad(True)
     window.timeout(50)
@@ -550,8 +618,9 @@ def run_ui(window, worker, monitor, player, demo=False):
     notice, notice_until = "", 0
     start = time.monotonic()
     demo_paused, demo_volume = False, 65
-    while True:
-        state = demo_state(start, demo_paused, demo_volume) if demo else worker.snapshot()
+    demo_paused_at = None
+    while not should_stop():
+        state = demo_state(start, demo_paused, demo_volume, demo_paused_at) if demo else worker.snapshot()
         if demo:
             age = time.monotonic() - start
             audio = ([0 if demo_paused else (0.4 + 0.3 * math.sin(i * 0.4 + age * 2)) * (1 - i / 45) for i in range(32)],
@@ -575,9 +644,12 @@ def run_ui(window, worker, monitor, player, demo=False):
         if key == "v":
             mode = (mode + 1) % 3
             continue
-        if key == "d":
+        if key in ("d", "D", "b"):
             if demo:
                 notice = "Demo mode: no Spotify commands are sent."
+            elif key in ("d", "D"):
+                worker.command("/player/play", {"uri": DJ_URI})
+                notice = ""
             else:
                 try:
                     subprocess.Popen(["xdg-open", DJ_URL], stdin=subprocess.DEVNULL,
@@ -588,7 +660,7 @@ def run_ui(window, worker, monitor, player, demo=False):
             notice_until = time.monotonic() + 8
             continue
         if key == "o":
-            value = prompt_link(window, colors)
+            value = prompt_link(window, colors, should_stop)
             if value:
                 try:
                     uri = spotify_uri(value)
@@ -603,7 +675,14 @@ def run_ui(window, worker, monitor, player, demo=False):
         command, payload = None, None
         if key == " ":
             command = "/player/playpause"
-            demo_paused = not demo_paused
+            if demo:
+                now = time.monotonic()
+                if demo_paused:
+                    start += now - demo_paused_at
+                    demo_paused_at = None
+                else:
+                    demo_paused_at = now
+                demo_paused = not demo_paused
         elif key in ("n", "p"):
             command = "/player/next" if key == "n" else "/player/prev"
         elif key in ("+", "=", "-", "_"):
@@ -619,6 +698,7 @@ def run_ui(window, worker, monitor, player, demo=False):
             else:
                 volume = muted_volume or round((status.get("volume_steps") or 100) * 0.5)
             command, payload = "/player/volume", {"volume": volume}
+            demo_volume = volume
         elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
             command, payload = "/player/seek", {"position": -10000 if key == curses.KEY_LEFT else 10000, "relative": True}
         if command and not demo:
@@ -631,33 +711,57 @@ def run_ui(window, worker, monitor, player, demo=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--demo", action="store_true", help="preview the interface without Spotify or audio capture")
+    parser.add_argument("--no-autoplay", action="store_true", help="leave playback idle on launch; press d to start DJ X")
     args = parser.parse_args()
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("run djamp in an interactive terminal")
     os.umask(0o077)
     player = worker = monitor = None
+    shutdown_requested = False
+    previous_handlers = {}
+
+    def request_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        # Defer cleanup until startup/input returns; interrupting Popen could
+        # leave a child running before PlayerProcess has recorded ownership.
+        shutdown_requested = True
+
+    def should_stop():
+        return shutdown_requested
+
     try:
-        if not args.demo:
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, request_shutdown)
+        if not args.demo and not shutdown_requested:
             api = API()
             player = PlayerProcess(api)
             player.start()
-            worker, monitor = PlayerWorker(api), AudioMonitor()
+            worker, monitor = PlayerWorker(api, autoplay=not args.no_autoplay), AudioMonitor()
             worker.start()
             monitor.start()
-        curses.wrapper(run_ui, worker, monitor, player, args.demo)
+        if not shutdown_requested:
+            curses.wrapper(run_ui, worker, monitor, player, args.demo, should_stop)
         return 0
     except KeyboardInterrupt:
         return 0
     except (OSError, RuntimeError, ValueError, curses.error) as exc:
+        if shutdown_requested:
+            return 0
         print(f"djamp: {clean(exc)}", file=sys.stderr)
         return 1
     finally:
-        if worker:
-            worker.stop_event.set()
-        if monitor:
-            monitor.close()
-        if player:
-            player.close()
+        try:
+            if worker:
+                worker.stop_event.set()
+            if monitor:
+                monitor.close()
+        finally:
+            try:
+                if player:
+                    player.close()
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
 
 
 if __name__ == "__main__":
