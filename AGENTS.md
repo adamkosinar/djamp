@@ -22,6 +22,9 @@ of Spotify's whole session.
 - `test_demo.py` and `test_shutdown.py`: demo controls and isolated subprocess
   checks for shutdown signals and backend ownership.
 - `test_startup.py` and `test_controls.py`: direct DJ startup and keyboard controls.
+- `test_playback_recovery.py`: playback failures, cooldowns, retries and queued controls.
+- `djamp_library.py`: Spotify library transport and its separate background worker.
+- `test_library.py` and `test_library_ui.py`: library requests, likes and browsing.
 - `backend/`: pinned upstream revision, DJ resolver patch and backend guidance.
 - `scripts/build-backend`: tested build and atomic backend installation.
 - `examples/go-librespot.yml`: shareable backend configuration template.
@@ -58,6 +61,9 @@ terminal and an authenticated backend.
 
 - Keep curses operations on the main thread. Backend requests and audio capture
   must not block terminal input; preserve bounded requests and reliable cleanup.
+- Keep library requests off the playback worker. Capture the displayed track
+  URI when liking, confirm writes before changing the like indicator, and reject
+  stale account/page responses. Keep access tokens in memory and out of logs.
 - Reuse the Unicode sanitizing and cell-width helpers for displayed metadata.
   Keep narrow terminals, missing metadata, and pairing prompts usable.
 - Follow the go-librespot v0.10.2 API specification linked in the README. The
@@ -68,6 +74,9 @@ terminal and an authenticated backend.
 - Persist DJ continuation only for the page that actually starts playback,
   never a prefetched page. Bind saved continuations to the account and session;
   failed loads must not consume them. Keep ordinary playback unchanged.
+- Treat opaque audio-key refusals as playback failures, not proof that a song is
+  restricted. Preserve the selected song for manual retry, keep cooldowns shared
+  across controls, and discard pending playback commands after such a failure.
 - Keep the backend API on loopback (`127.0.0.1:3678`). Reuse saved credentials.
   Stop only backend processes that DJamp starts; leave attached players running.
 - Capture the output monitor, never the microphone, for visualization. Keep

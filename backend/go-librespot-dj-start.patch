@@ -1,20 +1,215 @@
 diff --git a/api-spec.yml b/api-spec.yml
-index 662db9f..ff0759c 100644
+index 662db9f..d1f580d 100644
 --- a/api-spec.yml
 +++ b/api-spec.yml
-@@ -248,8 +248,11 @@ components:
+@@ -37,8 +37,12 @@ components:
+         - bit_depth
+       properties:
+         uri:
+-          description: URI
++          description: URI of the playable track or episode, after any relinking
+           type: string
++        requested_uri:
++          description: Original URI requested before relinking; use this identity for library operations
++          type: string
++          x-go-type-skip-optional-pointer: true
+         name:
+           description: Name
+           type: string
+@@ -102,6 +106,27 @@ components:
+             have no meaningful source bit depth
+           type: integer
+           nullable: true
++    playback_error:
++      x-go-name: ApiPlaybackError
++      description: A persistent playback failure, cleared only after a successful primary load
++      type: object
++      required: [kind, message, uri, retry_after_ms]
++      properties:
++        kind:
++          type: string
++          description: Failure category; audio_key_refused is an opaque refusal, not evidence of rate limiting or a track restriction
++        message:
++          type: string
++          description: Sanitized user-facing failure message
++        uri:
++          type: string
++          description: Desired track URI preserved for manual retry
++        retry_after_ms:
++          type: integer
++          format: int64
++          minimum: 0
++          maximum: 10000
++          description: Remaining cooldown in milliseconds; zero permits a manual retry, never an automatic retry
+     status:
+       x-go-name: ApiStatus
+       description: The player status
+@@ -169,6 +194,8 @@ components:
+         paused:
+           description: Whether the player is paused
+           type: boolean
++        playback_error:
++          $ref: "#/components/schemas/playback_error"
+         buffering:
+           description: Whether the player is buffering
+           type: boolean
+@@ -248,13 +275,76 @@ components:
        x-go-name: ApiRoot
        description: API reachability and playback readiness
        type: object
 -      required: [ playback_ready ]
-+      required: [ playback_ready, direct_dj ]
++      required: [ playback_ready, direct_dj, library ]
        properties:
++        library:
++          description: Whether liked-song browsing and saving are supported
++          type: boolean
 +        direct_dj:
 +          description: Whether /player/play can start a Spotify DJ session directly
 +          type: boolean
          playback_ready:
            description: >-
              Whether the daemon is fully bootstrapped and ready to accept
+             /player/play
+           type: boolean
++    libraryTrack:
++      x-go-name: ApiLibraryTrack
++      type: object
++      required: [ uri, name, artist_names, album_name, duration, playable ]
++      properties:
++        uri:
++          type: string
++        name:
++          type: string
++        artist_names:
++          type: array
++          items:
++            type: string
++        album_name:
++          type: string
++        duration:
++          type: integer
++          description: Duration in milliseconds
++        playable:
++          type: boolean
++          description: Whether metadata permits attempting playback in the account country; audio formats are checked when starting
++    libraryTracks:
++      x-go-name: ApiLibraryTracks
++      type: object
++      required: [ items, offset, limit, total, has_next ]
++      properties:
++        items:
++          type: array
++          items:
++            $ref: '#/components/schemas/libraryTrack'
++        offset:
++          type: integer
++        limit:
++          type: integer
++        total:
++          type: integer
++        has_next:
++          type: boolean
++    librarySaved:
++      x-go-name: ApiLibrarySaved
++      type: object
++      required: [ saved ]
++      properties:
++        saved:
++          type: boolean
++    librarySave:
++      x-go-name: ApiLibrarySave
++      type: object
++      required: [ uri, saved, username ]
++      properties:
++        uri:
++          type: string
++        saved:
++          type: boolean
++        username:
++          type: string
++          description: Expected authenticated account, checked before dispatch
+     volume:
+       x-go-name: ApiVolume
+       description: The player volume settings
+@@ -421,6 +511,78 @@ components:
+           x-go-type-skip-optional-pointer: true
+ 
+ paths:
++  /library/tracks:
++    get:
++      operationId: getLibraryTracks
++      description: Returns liked tracks, newest first, from a complete per-account collection snapshot cached for 60 seconds
++      parameters:
++        - in: query
++          name: offset
++          schema:
++            type: integer
++            minimum: 0
++        - in: query
++          name: limit
++          schema:
++            type: integer
++            minimum: 1
++            maximum: 100
++        - in: query
++          name: refresh
++          schema:
++            type: boolean
++        - in: query
++          name: username
++          schema:
++            type: string
++      responses:
++        200:
++          description: Complete collection count and one metadata page
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/libraryTracks'
++  /library/contains:
++    get:
++      operationId: getLibraryContains
++      description: Checks a track against the complete collection; errors never mean not saved
++      parameters:
++        - in: query
++          name: uri
++          required: true
++          schema:
++            type: string
++        - in: query
++          name: username
++          required: true
++          schema:
++            type: string
++      responses:
++        200:
++          description: Saved status
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/librarySaved'
++  /library/save:
++    post:
++      operationId: saveLibraryTrack
++      description: Sets one track's saved state for the expected account; confirms only after Spotify accepts the update
++      requestBody:
++        required: true
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/librarySave'
++      responses:
++        200:
++          description: Confirmed saved state
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/librarySaved'
++        409:
++          description: The authenticated account changed
+   /:
+     get:
+       operationId: getRoot
 diff --git a/cmd/daemon/file_state_store_test.go b/cmd/daemon/file_state_store_test.go
 index 343a799..11b63bc 100644
 --- a/cmd/daemon/file_state_store_test.go
@@ -61,21 +256,443 @@ index 343a799..11b63bc 100644
 +	require.Len(t, entries, 1, "atomic saves should leave no temporary files")
 +}
 diff --git a/daemon/api_gen.go b/daemon/api_gen.go
-index 4be8c8d..8d5dd70 100644
+index 4be8c8d..26404ac 100644
 --- a/daemon/api_gen.go
 +++ b/daemon/api_gen.go
-@@ -107,6 +107,9 @@ type ApiRepeatTrack struct {
+@@ -66,6 +66,43 @@ type ApiDeviceAuth struct {
+ 	Url string `json:"url"`
+ }
+ 
++// ApiLibrarySave defines model for librarySave.
++type ApiLibrarySave struct {
++	Saved bool   `json:"saved"`
++	Uri   string `json:"uri"`
++
++	// Username Expected authenticated account, checked before dispatch
++	Username string `json:"username"`
++}
++
++// ApiLibrarySaved defines model for librarySaved.
++type ApiLibrarySaved struct {
++	Saved bool `json:"saved"`
++}
++
++// ApiLibraryTrack defines model for libraryTrack.
++type ApiLibraryTrack struct {
++	AlbumName   string   `json:"album_name"`
++	ArtistNames []string `json:"artist_names"`
++
++	// Duration Duration in milliseconds
++	Duration int    `json:"duration"`
++	Name     string `json:"name"`
++
++	// Playable Whether metadata permits attempting playback in the account country; audio formats are checked when starting
++	Playable bool   `json:"playable"`
++	Uri      string `json:"uri"`
++}
++
++// ApiLibraryTracks defines model for libraryTracks.
++type ApiLibraryTracks struct {
++	HasNext bool              `json:"has_next"`
++	Items   []ApiLibraryTrack `json:"items"`
++	Limit   int               `json:"limit"`
++	Offset  int               `json:"offset"`
++	Total   int               `json:"total"`
++}
++
+ // ApiNext A skip to next payload
+ type ApiNext struct {
+ 	// Uri The track URI to skip to. When omitted the next track in the context is played.
+@@ -93,6 +130,21 @@ type ApiPlay struct {
+ 	Uri string `json:"uri"`
+ }
+ 
++// ApiPlaybackError A persistent playback failure, cleared only after a successful primary load
++type ApiPlaybackError struct {
++	// Kind Failure category; audio_key_refused is an opaque refusal, not evidence of rate limiting or a track restriction
++	Kind string `json:"kind"`
++
++	// Message Sanitized user-facing failure message
++	Message string `json:"message"`
++
++	// RetryAfterMs Remaining cooldown in milliseconds; zero permits a manual retry, never an automatic retry
++	RetryAfterMs int64 `json:"retry_after_ms"`
++
++	// Uri Desired track URI preserved for manual retry
++	Uri string `json:"uri"`
++}
++
+ // ApiRepeatContext A toggle repeating context payload
+ type ApiRepeatContext struct {
+ 	// RepeatContext Whether repeating context should be enabled
+@@ -107,6 +159,12 @@ type ApiRepeatTrack struct {
  
  // ApiRoot API reachability and playback readiness
  type ApiRoot struct {
 +	// DirectDj Whether /player/play can start a Spotify DJ session directly
 +	DirectDj bool `json:"direct_dj"`
 +
++	// Library Whether liked-song browsing and saving are supported
++	Library bool `json:"library"`
++
  	// PlaybackReady Whether the daemon is fully bootstrapped and ready to accept /player/play
  	PlaybackReady bool `json:"playback_ready"`
  }
+@@ -173,6 +231,9 @@ type ApiStatus struct {
+ 	// PlayOriginDeviceId The device ID that sent the command starting the playback, null when the playback was started locally through this API
+ 	PlayOriginDeviceId *string `json:"play_origin_device_id"`
+ 
++	// ApiPlaybackError A persistent playback failure, cleared only after a successful primary load
++	ApiPlaybackError *ApiPlaybackError `json:"playback_error,omitempty"`
++
+ 	// RepeatContext Whether the repeat context feature is enabled
+ 	RepeatContext bool `json:"repeat_context"`
+ 
+@@ -240,13 +301,16 @@ type ApiTrack struct {
+ 	// ReleaseDate Album release date, empty for episodes
+ 	ReleaseDate string `json:"release_date"`
+ 
++	// RequestedUri Original URI requested before relinking; use this identity for library operations
++	RequestedUri string `json:"requested_uri,omitempty"`
++
+ 	// SampleRate Sample rate of the decoded audio in Hz
+ 	SampleRate *int `json:"sample_rate"`
+ 
+ 	// TrackNumber Track number within the disc, zero for episodes
+ 	TrackNumber int `json:"track_number"`
+ 
+-	// Uri URI
++	// Uri URI of the playable track or episode, after any relinking
+ 	Uri string `json:"uri"`
+ }
+ 
+@@ -268,6 +332,23 @@ type GetContextTracksParams struct {
+ 	Uri string `form:"uri" json:"uri"`
+ }
+ 
++// GetLibraryContainsParams defines parameters for GetLibraryContains.
++type GetLibraryContainsParams struct {
++	Uri      string `form:"uri" json:"uri"`
++	Username string `form:"username" json:"username"`
++}
++
++// GetLibraryTracksParams defines parameters for GetLibraryTracks.
++type GetLibraryTracksParams struct {
++	Offset   *int    `form:"offset,omitempty" json:"offset,omitempty"`
++	Limit    *int    `form:"limit,omitempty" json:"limit,omitempty"`
++	Refresh  *bool   `form:"refresh,omitempty" json:"refresh,omitempty"`
++	Username *string `form:"username,omitempty" json:"username,omitempty"`
++}
++
++// SaveLibraryTrackJSONRequestBody defines body for SaveLibraryTrack for application/json ContentType.
++type SaveLibraryTrackJSONRequestBody = ApiLibrarySave
++
+ // PlayerAddToQueueJSONRequestBody defines body for PlayerAddToQueue for application/json ContentType.
+ type PlayerAddToQueueJSONRequestBody = ApiAddToQueue
+ 
+@@ -313,6 +394,15 @@ type ServerInterface interface {
+ 	// (GET /events)
+ 	GetEvents(w http.ResponseWriter, r *http.Request)
+ 
++	// (GET /library/contains)
++	GetLibraryContains(w http.ResponseWriter, r *http.Request, params GetLibraryContainsParams)
++
++	// (POST /library/save)
++	SaveLibraryTrack(w http.ResponseWriter, r *http.Request)
++
++	// (GET /library/tracks)
++	GetLibraryTracks(w http.ResponseWriter, r *http.Request, params GetLibraryTracksParams)
++
+ 	// (POST /player/add_to_queue)
+ 	PlayerAddToQueue(w http.ResponseWriter, r *http.Request)
+ 
+@@ -453,6 +543,120 @@ func (siw *ServerInterfaceWrapper) GetEvents(w http.ResponseWriter, r *http.Requ
+ 	handler.ServeHTTP(w, r)
+ }
+ 
++// GetLibraryContains operation middleware
++func (siw *ServerInterfaceWrapper) GetLibraryContains(w http.ResponseWriter, r *http.Request) {
++
++	var err error
++
++	// Parameter object where we will unmarshal all parameters from the context
++	var params GetLibraryContainsParams
++
++	// ------------- Required query parameter "uri" -------------
++
++	if paramValue := r.URL.Query().Get("uri"); paramValue != "" {
++
++	} else {
++		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "uri"})
++		return
++	}
++
++	err = runtime.BindQueryParameter("form", true, true, "uri", r.URL.Query(), &params.Uri)
++	if err != nil {
++		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "uri", Err: err})
++		return
++	}
++
++	// ------------- Required query parameter "username" -------------
++
++	if paramValue := r.URL.Query().Get("username"); paramValue != "" {
++
++	} else {
++		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "username"})
++		return
++	}
++
++	err = runtime.BindQueryParameter("form", true, true, "username", r.URL.Query(), &params.Username)
++	if err != nil {
++		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "username", Err: err})
++		return
++	}
++
++	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		siw.Handler.GetLibraryContains(w, r, params)
++	}))
++
++	for _, middleware := range siw.HandlerMiddlewares {
++		handler = middleware(handler)
++	}
++
++	handler.ServeHTTP(w, r)
++}
++
++// SaveLibraryTrack operation middleware
++func (siw *ServerInterfaceWrapper) SaveLibraryTrack(w http.ResponseWriter, r *http.Request) {
++
++	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		siw.Handler.SaveLibraryTrack(w, r)
++	}))
++
++	for _, middleware := range siw.HandlerMiddlewares {
++		handler = middleware(handler)
++	}
++
++	handler.ServeHTTP(w, r)
++}
++
++// GetLibraryTracks operation middleware
++func (siw *ServerInterfaceWrapper) GetLibraryTracks(w http.ResponseWriter, r *http.Request) {
++
++	var err error
++
++	// Parameter object where we will unmarshal all parameters from the context
++	var params GetLibraryTracksParams
++
++	// ------------- Optional query parameter "offset" -------------
++
++	err = runtime.BindQueryParameter("form", true, false, "offset", r.URL.Query(), &params.Offset)
++	if err != nil {
++		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "offset", Err: err})
++		return
++	}
++
++	// ------------- Optional query parameter "limit" -------------
++
++	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
++	if err != nil {
++		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
++		return
++	}
++
++	// ------------- Optional query parameter "refresh" -------------
++
++	err = runtime.BindQueryParameter("form", true, false, "refresh", r.URL.Query(), &params.Refresh)
++	if err != nil {
++		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "refresh", Err: err})
++		return
++	}
++
++	// ------------- Optional query parameter "username" -------------
++
++	err = runtime.BindQueryParameter("form", true, false, "username", r.URL.Query(), &params.Username)
++	if err != nil {
++		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "username", Err: err})
++		return
++	}
++
++	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		siw.Handler.GetLibraryTracks(w, r, params)
++	}))
++
++	for _, middleware := range siw.HandlerMiddlewares {
++		handler = middleware(handler)
++	}
++
++	handler.ServeHTTP(w, r)
++}
++
+ // PlayerAddToQueue operation middleware
+ func (siw *ServerInterfaceWrapper) PlayerAddToQueue(w http.ResponseWriter, r *http.Request) {
+ 
+@@ -829,6 +1033,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
+ 	m.HandleFunc("GET "+options.BaseURL+"/auth/code", wrapper.GetAuthCode)
+ 	m.HandleFunc("GET "+options.BaseURL+"/context/tracks", wrapper.GetContextTracks)
+ 	m.HandleFunc("GET "+options.BaseURL+"/events", wrapper.GetEvents)
++	m.HandleFunc("GET "+options.BaseURL+"/library/contains", wrapper.GetLibraryContains)
++	m.HandleFunc("POST "+options.BaseURL+"/library/save", wrapper.SaveLibraryTrack)
++	m.HandleFunc("GET "+options.BaseURL+"/library/tracks", wrapper.GetLibraryTracks)
+ 	m.HandleFunc("POST "+options.BaseURL+"/player/add_to_queue", wrapper.PlayerAddToQueue)
+ 	m.HandleFunc("POST "+options.BaseURL+"/player/next", wrapper.PlayerNext)
+ 	m.HandleFunc("POST "+options.BaseURL+"/player/output", wrapper.PlayerOutput)
+diff --git a/daemon/api_requested_uri_test.go b/daemon/api_requested_uri_test.go
+new file mode 100644
+index 0000000..89a2966
+--- /dev/null
++++ b/daemon/api_requested_uri_test.go
+@@ -0,0 +1,73 @@
++//go:build test_unit
++
++package daemon
++
++import (
++	"encoding/json"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/stretchr/testify/require"
++)
++
++func TestApiTrackPreservesRequestedURIThroughRelinking(t *testing.T) {
++	original := librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, gid(1))
++	alternative := librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, gid(2))
++	p := &AppPlayer{app: &App{cfg: &Config{}}, prodInfo: &ProductInfo{}}
++
++	for _, tc := range []struct {
++		name      string
++		requested librespot.SpotifyId
++		playable  librespot.SpotifyId
++		want      string
++	}{
++		{"relinked", original, alternative, original.Uri()},
++		{"ordinary", original, original, original.Uri()},
++		{"unknown request falls back to media", librespot.SpotifyId{}, alternative, alternative.Uri()},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			stream := &player.Stream{
++				RequestedId: tc.requested,
++				Media:       librespot.NewMediaFromTrack(metaTrack(tc.playable.Id(), "Song")),
++			}
++			// /status and metadata events use this same constructor. Preserve
++			// the existing playable URI while exposing the library identity.
++			track := p.newApiResponseStatusTrack(stream, 123)
++			require.Equal(t, tc.playable.Uri(), track.Uri)
++			require.Equal(t, tc.want, track.RequestedUri)
++			require.EqualValues(t, 123, track.Position)
++
++			raw, err := json.Marshal(ApiEvent{Type: ApiEventTypeMetadata, Data: ApiEventDataMetadata(*track)})
++			require.NoError(t, err)
++			var event struct {
++				Data struct {
++					Uri          string `json:"uri"`
++					RequestedUri string `json:"requested_uri"`
++				} `json:"data"`
++			}
++			require.NoError(t, json.Unmarshal(raw, &event))
++			require.Equal(t, tc.playable.Uri(), event.Data.Uri)
++			require.Equal(t, tc.want, event.Data.RequestedUri)
++		})
++	}
++}
++
++func TestApiCachedTracksKeepTheirContextURIForLibraryOperations(t *testing.T) {
++	original, alternative := trackUri(1), trackUri(2)
++	p := newMetaTestPlayer(t, nil, nil)
++	p.app.metaCache.put(original, librespot.NewMediaFromTrack(metaTrack(gid(2), "Relinked song")))
++	p.state.player.NextTracks = []*connectpb.ProvidedTrack{provided(original)}
++
++	next := p.apiNextTrack()
++	require.NotNil(t, next)
++	require.Equal(t, alternative, next.Uri)
++	require.Equal(t, original, next.RequestedUri)
++
++	listing := p.contextTracksResponse("spotify:user:account:collection", []string{original}, true)
++	require.Len(t, listing.Tracks, 1)
++	require.Equal(t, original, listing.Tracks[0].Uri)
++	require.Equal(t, alternative, listing.Tracks[0].Track.Uri)
++	require.Equal(t, original, listing.Tracks[0].Track.RequestedUri)
++}
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+index 02bf0b2..4a70dd6 100644
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -97,6 +97,7 @@ func (c *wsClient) send(log librespot.Logger, ev *ApiEvent) bool {
+ }
+ 
+ var (
++	ErrConflictAccount  = errors.New("Spotify account changed")
+ 	ErrNoSession        = errors.New("no session")
+ 	ErrBadRequest       = errors.New("bad request")
+ 	ErrForbidden        = errors.New("forbidden")
+@@ -128,6 +129,9 @@ const (
+ 	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
+ 	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
+ 	ApiRequestTypeContextTracks       ApiRequestType = "context_tracks"
++	ApiRequestTypeLibraryTracks       ApiRequestType = "library_tracks"
++	ApiRequestTypeLibraryContains     ApiRequestType = "library_contains"
++	ApiRequestTypeLibrarySave         ApiRequestType = "library_save"
+ )
+ 
+ // ApiRequestDataContextTracks carries the uri query parameter of the context
+@@ -234,6 +238,10 @@ func (p *AppPlayer) newApiResponseStatusTrack(stream *player.Stream, position in
+ 	media := stream.Media
+ 
+ 	resp := p.newApiResponseStatusMedia(media, position)
++	resp.RequestedUri = resp.Uri
++	if len(stream.RequestedId.Id()) == 16 {
++		resp.RequestedUri = stream.RequestedId.Uri()
++	}
+ 
+ 	// The file is what actually got decoded, so report from it rather than from
+ 	// the requested bitrate: they differ whenever the preferred format was not
+@@ -434,7 +442,11 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
+ 		case errors.Is(resp.err, ErrTooManyRequests):
+ 			w.WriteHeader(http.StatusTooManyRequests)
+ 			return
+-		case errors.Is(resp.err, ErrSuperseded), errors.Is(resp.err, ErrLoaderBusy):
++		case errors.Is(resp.err, errPlaybackCooldown):
++			w.WriteHeader(http.StatusServiceUnavailable)
++			_, _ = io.WriteString(w, errPlaybackCooldown.Error())
++			return
++		case errors.Is(resp.err, ErrSuperseded), errors.Is(resp.err, ErrLoaderBusy), errors.Is(resp.err, ErrConflictAccount):
+ 			w.WriteHeader(http.StatusConflict)
+ 			return
+ 		case errors.Is(resp.err, ErrBadRequest):
+@@ -784,3 +796,28 @@ func (s *ConcreteApiServer) Close() error {
+ 	_ = s.listener.Close()
+ 	return nil
+ }
++
++func (s *ConcreteApiServer) GetLibraryTracks(w http.ResponseWriter, r *http.Request, params GetLibraryTracksParams) {
++	s.handleRequest(ApiRequest{Type: ApiRequestTypeLibraryTracks, Data: params}, w)
++}
++func (s *ConcreteApiServer) GetLibraryContains(w http.ResponseWriter, r *http.Request, params GetLibraryContainsParams) {
++	if !validLibraryURI(params.Uri) || params.Username == "" {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	s.handleRequest(ApiRequest{Type: ApiRequestTypeLibraryContains, Data: params}, w)
++}
++func (s *ConcreteApiServer) SaveLibraryTrack(w http.ResponseWriter, r *http.Request) {
++	r.Body = http.MaxBytesReader(w, r.Body, 4096)
++	var payload struct {
++		Uri      string `json:"uri"`
++		Saved    *bool  `json:"saved"`
++		Username string `json:"username"`
++	}
++	if err := jsonDecode(r, &payload); err != nil || !validLibraryURI(payload.Uri) || payload.Username == "" || payload.Saved == nil {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	data := ApiLibrarySave{Uri: payload.Uri, Saved: *payload.Saved, Username: payload.Username}
++	s.handleRequest(ApiRequest{Type: ApiRequestTypeLibrarySave, Data: data}, w)
++}
 diff --git a/daemon/api_server_test.go b/daemon/api_server_test.go
-index 63aa856..08aa79c 100644
+index 63aa856..dfb98c2 100644
 --- a/daemon/api_server_test.go
 +++ b/daemon/api_server_test.go
 @@ -167,13 +167,13 @@ func TestApiRejectsWrongMethod(t *testing.T) {
@@ -83,19 +700,19 @@ index 63aa856..08aa79c 100644
  func TestApiRoot(t *testing.T) {
  	ts := newTestServer(t, func(ApiRequest) (any, error) {
 -		return &ApiRoot{PlaybackReady: true}, nil
-+		return &ApiRoot{PlaybackReady: true, DirectDj: true}, nil
++		return &ApiRoot{PlaybackReady: true, DirectDj: true, Library: true}, nil
  	})
  
  	resp := ts.do(http.MethodGet, "/", nil)
  	require.Equal(t, http.StatusOK, resp.StatusCode)
  	require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 -	require.JSONEq(t, `{"playback_ready":true}`, body(t, resp))
-+	require.JSONEq(t, `{"playback_ready":true,"direct_dj":true}`, body(t, resp))
++	require.JSONEq(t, `{"playback_ready":true,"direct_dj":true,"library":true}`, body(t, resp))
  
  	require.Equal(t, ApiRequestTypeRoot, ts.request().Type)
  }
 diff --git a/daemon/app.go b/daemon/app.go
-index 1479539..fe55fa7 100644
+index 1479539..e9f2b19 100644
 --- a/daemon/app.go
 +++ b/daemon/app.go
 @@ -59,7 +59,8 @@ type App struct {
@@ -144,39 +761,271 @@ index 1479539..fe55fa7 100644
  					switch req.Type {
  					case ApiRequestTypeRoot:
 -						req.Reply(&ApiRoot{}, nil)
-+						req.Reply(&ApiRoot{DirectDj: true}, nil)
++						req.Reply(&ApiRoot{DirectDj: true, Library: true}, nil)
  					case ApiRequestSetDeviceName:
  						// The device name drives the zeroconf advertisement, which
  						// runs independently of any player session, so handle it
 diff --git a/daemon/controls.go b/daemon/controls.go
-index 27f3dd1..e270f58 100644
+index 27f3dd1..0d4d420 100644
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
-@@ -325,6 +325,7 @@ type skipToFunc func(*connectpb.ContextTrack) bool
+@@ -14,7 +14,6 @@ import (
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+-	"github.com/devgianlu/go-librespot/audio"
+ 	"github.com/devgianlu/go-librespot/mpris"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+@@ -29,6 +28,10 @@ import (
+ // it runs on the loader lane, because a prefetch is a full track load — audio
+ // key, storage resolve, first chunk, and any narration around it.
+ func (p *AppPlayer) prefetchNext() {
++	if p.playbackCooldownError() != nil || p.prefetchKeyFailure || p.playbackFailure != nil {
++		return
++	}
++
+ 	repeatingTrack := p.state.player.Options.RepeatingTrack
+ 
+ 	// With repeat-track enabled the next thing to play is this same track
+@@ -67,6 +70,10 @@ func (p *AppPlayer) prefetchNext() {
+ // submitPrefetch queues the stream for uri unless it is already the one waiting.
+ // Runs on the player loop, so it can check what is already prefetched.
+ func (p *AppPlayer) submitPrefetch(uri string, metadata map[string]string) {
++	if p.playbackCooldownError() != nil || p.prefetchKeyFailure || p.playbackFailure != nil {
++		return
++	}
++
+ 	if uri == "" {
+ 		// It should be implemented some day (the ContextTrack has enough
+ 		// information to infer the track Uri) but it's hard to reproduce this
+@@ -90,7 +97,7 @@ func (p *AppPlayer) submitPrefetch(uri string, metadata map[string]string) {
+ 		class: classPrefetch,
+ 		gen:   p.prefetchGen,
+ 		run: func(ctx context.Context) loaderResult {
+-			stream, err := p.player.NewStream(ctx, p.app.client, *nextId, p.app.cfg.Bitrate, 0)
++			stream, err := p.newStream(ctx, *nextId, 0)
+ 			if err != nil {
+ 				return loaderResult{err: fmt.Errorf("failed prefetching %s stream: %w", nextId.Type(), err)}
+ 			}
+@@ -138,7 +145,7 @@ func (p *AppPlayer) commitPrefetch(stream *player.Stream, source librespot.Audio
+ }
+ 
+ func (p *AppPlayer) schedulePrefetchNext() {
+-	if p.state.player.IsPaused || p.primaryStream == nil {
++	if p.state.player.IsPaused || p.primaryStream == nil || p.playbackCooldownError() != nil || p.prefetchKeyFailure || p.playbackFailure != nil {
+ 		p.prefetchTimer.Stop()
+ 		return
+ 	}
+@@ -181,6 +188,10 @@ func (p *AppPlayer) emitMprisUpdate(playbackStatus mpris.PlaybackStatus) {
+ }
+ 
+ func (p *AppPlayer) handlePlayerEvent(ev *player.Event) {
++	// Old output events cannot restart or advance a failed selection.
++	if p.playbackFailure != nil && p.primaryStream == nil && !p.loadInFlight && ev.Type != player.EventTypeStop {
++		return
++	}
+ 	switch ev.Type {
+ 	case player.EventTypePlay:
+ 		p.state.player.IsPlaying = true
+@@ -253,6 +264,11 @@ func (p *AppPlayer) handlePlayerEvent(ev *player.Event) {
+ 			},
+ 		})
+ 	case player.EventTypeNotPlaying:
++		if p.prefetchKeyFailure && p.playbackCooldownError() != nil && !p.sleepAtEndOfTrack {
++			p.stopAfterPrefetchRefusal()
++			return
++		}
++		p.prefetchKeyFailure = false
+ 		p.sess.Events().OnPlayerEnd(p.primaryStream, p.state.trackPosition())
+ 
+ 		// Played to the end: clear the resume point before advancing, so that
+@@ -325,6 +341,26 @@ type skipToFunc func(*connectpb.ContextTrack) bool
  // and walking it to the starting track runs on the loader lane, and the track
  // it lands on is loaded once it has.
  func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, paused, drop bool, then func(error)) {
++	var queued []*connectpb.ContextTrack
++	if p.state.tracks != nil {
++		queued = p.state.tracks.UpcomingQueue()
++	}
++	p.loadContextWithQueue(spotCtx, skipTo, paused, drop, queued, then)
++}
++
++func (p *AppPlayer) loadContextWithQueue(spotCtx *connectpb.Context, skipTo skipToFunc, paused, drop bool, queued []*connectpb.ContextTrack, then func(error)) {
++	if err := p.playbackCooldownError(); err != nil {
++		then(err)
++		return
++	}
++
++	p.retryContext = func() {
++		dj := p.djPlayback
++		p.loadContextWithQueue(spotCtx, skipTo, false, true, queued, then)
++		p.djPlayback = dj
++	}
++	p.state.tracks = nil
 +	p.djPlayback = nil
  	p.state.setPaused(paused)
  
  	sessionId := make([]byte, 16)
-@@ -419,6 +420,7 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+@@ -368,15 +404,6 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+ 	shuffle := p.state.player.Options.ShufflingContext
+ 	p.loadGen++
+ 
+-	// Starting a context leaves the queue alone, as the official clients do.
+-	// In a Jam it holds what the participants added, and the host starting a
+-	// playlist used to throw it away. A queued track that is playing has been
+-	// jumped away from, so it goes.
+-	var queued []*connectpb.ContextTrack
+-	if p.state.tracks != nil {
+-		queued = p.state.tracks.UpcomingQueue()
+-	}
+-
+ 	p.loader.submit(loaderJob{
+ 		name:  "resolve " + spotCtx.Uri,
+ 		class: classLoad,
+@@ -385,13 +412,19 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+ 			list, snap, err := resolveContext(ctx, p.app.log, p.sess.Spclient(), spotCtx, skipTo, shuffle, queued)
+ 			if err != nil {
+ 				return loaderResult{
+-					err:    err,
+-					commit: func(_ *AppPlayer, err error) { then(err) },
++					err: err,
++					commit: func(p *AppPlayer, err error) {
++						if p.playbackFailure != nil {
++							p.holdFailedPlayback()
++						}
++						then(err)
++					},
+ 				}
+ 			}
+ 
+ 			return loaderResult{
+ 				commit: func(p *AppPlayer, err error) {
++					p.retryContext = nil
+ 					p.state.tracks = list
+ 					p.state.player.ContextMetadata = contextMetadata(spotCtx.Metadata, snap.Metadata)
+ 					p.publishSnapshot(snap)
+@@ -419,7 +452,12 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
  // around the stream are replaced once the context has resolved, and the stream
  // itself is left alone.
  func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sentBy string, paused, continuation bool) {
 +	p.djPlayback = nil
  	spotCtx := transferState.CurrentSession.Context
++	if !continuation {
++		p.retryContext = func() { p.transferContext(transferState, sentBy, false, false) }
++		p.state.tracks = nil
++	}
  	shuffle := transferState.Options.GetShufflingContext()
  	current := transferState.Playback.CurrentTrack
-@@ -627,6 +629,7 @@ func abs(v int64) int64 {
+ 	queue := transferState.Queue
+@@ -435,8 +473,14 @@ func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sent
+ 			return loaderResult{err: err}
+ 		}
+ 		return loaderResult{
+-			err:    err,
+-			commit: func(p *AppPlayer, _ error) { p.abandonTransfer() },
++			err: err,
++			commit: func(p *AppPlayer, _ error) {
++				if p.playbackFailure != nil {
++					p.holdFailedPlayback()
++				} else {
++					p.abandonTransfer()
++				}
++			},
+ 		}
+ 	}
+ 
+@@ -538,6 +582,7 @@ func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sent
+ 					}
+ 
+ 					p.state.queueID = highestQueueID(queue.GetTracks())
++					p.retryContext = nil
+ 					p.state.tracks = list
+ 					p.state.player.ContextMetadata = contextMetadata(played.Metadata, snap.Metadata)
+ 					p.publishSnapshot(snap)
+@@ -627,6 +672,8 @@ func abs(v int64) int64 {
  // cast onto it can start something else straight away. That is why this is not
  // stopPlayback, which hands a zeroconf session back.
  func (p *AppPlayer) abandonTransfer() {
++	p.retryContext = nil
 +	p.djPlayback = nil
  	// Anything still playing belongs to whatever came before the transfer, and
  	// is not what the state is about to describe. Stopping it announces itself
  	// through the player's stop event.
-@@ -1035,6 +1038,8 @@ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, t
+@@ -738,12 +785,10 @@ func resolveContext(ctx context.Context, log librespot.Logger, sp *spclient.Spcl
+ 
+ // isUnplayableMedia reports whether a load failed for a reason that skipping
+ // forward can get past: media the account may not play, media in no format the
+-// daemon supports, or a track whose audio key Spotify refused.
++// daemon supports. An opaque audio-key refusal is not a track restriction.
+ func isUnplayableMedia(err error) bool {
+-	var keyErr *audio.KeyProviderError
+ 	return errors.Is(err, librespot.ErrMediaRestricted) ||
+-		errors.Is(err, librespot.ErrNoSupportedFormats) ||
+-		errors.As(err, &keyErr)
++		errors.Is(err, librespot.ErrNoSupportedFormats)
+ }
+ 
+ // loadCurrentTrackOrSkip loads the current track; if it is unplayable it
+@@ -776,9 +821,13 @@ func (p *AppPlayer) loadCurrentTrackOrSkip(paused, drop, resume bool, then func(
+ //
+ // The fetch is held back by delay, during which a newer load drops it unstarted.
+ // Once started it cannot be recalled: the audio key request goes out before the
+-// fetch can be cancelled, and a burst of those is what gets the daemon rate
+-// limited.
++// fetch can be cancelled, so bursts must be bounded before they reach the network.
+ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Duration, then func(error)) {
++	if err := p.playbackCooldownError(); err != nil {
++		then(err)
++		return
++	}
++
+ 	if p.primaryStream != nil {
+ 		unloadPosition := p.player.PositionMs()
+ 		p.sess.Events().OnPrimaryStreamUnload(p.primaryStream, unloadPosition)
+@@ -893,6 +942,9 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
+ 					err: err,
+ 					commit: func(p *AppPlayer, err error) {
+ 						p.emitPlaybackError(playbackErrorStageLoad, spotId.Uri(), err)
++						if p.playbackFailure != nil && !isAudioKeyRefusal(err) && !isUnplayableMedia(err) {
++							p.holdFailedPlayback()
++						}
+ 						then(err)
+ 					},
+ 				}
+@@ -935,6 +987,13 @@ type fetchTrackOpts struct {
+ 	prefetchedSource librespot.AudioSource
+ }
+ 
++func (p *AppPlayer) newStream(ctx context.Context, id librespot.SpotifyId, position int64) (*player.Stream, error) {
++	if p.streamFactory != nil {
++		return p.streamFactory(ctx, id, position)
++	}
++	return p.player.NewStream(ctx, p.app.client, id, p.app.cfg.Bitrate, position)
++}
++
+ // fetchTrack builds the stream for a track and hands it to the player. Runs on
+ // the loader lane, so it touches nothing the player loop owns.
+ // The stream generation it returns identifies the events the player will raise
+@@ -946,7 +1005,7 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+ 	stream := opts.prefetchedStream
+ 	if stream == nil {
+ 		var err error
+-		if stream, err = p.player.NewStream(ctx, p.app.client, spotId, p.app.cfg.Bitrate, opts.position); err != nil {
++		if stream, err = p.newStream(ctx, spotId, opts.position); err != nil {
+ 			return nil, 0, fmt.Errorf("failed creating stream for %s: %w", spotId, err)
+ 		}
+ 	} else if !opts.fromStart {
+@@ -999,6 +1058,8 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+ 
+ // commitLoad reports the track the player is now on. Runs on the player loop.
+ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, trackPosition int64, prefetched bool) {
++	p.playbackFailure = nil
++	p.prefetchKeyFailure = false
+ 	p.primaryStream = stream
+ 
+ 	// A play or pause that arrived while this was loading asked for a state the
+@@ -1035,6 +1096,8 @@ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, t
  	p.state.player.IsPlaying = true
  	p.state.player.IsBuffering = false
  	p.state.setPaused(paused) // update IsPaused and PlaybackSpeed
@@ -185,7 +1034,40 @@ index 27f3dd1..e270f58 100644
  	p.updateState()
  	p.schedulePrefetchNext()
  
-@@ -1237,6 +1242,7 @@ func (p *AppPlayer) play() error {
+@@ -1208,7 +1271,32 @@ func (p *AppPlayer) setQueue(prev []*connectpb.ContextTrack, next []*connectpb.C
+ }
+ 
+ func (p *AppPlayer) play() error {
++	if err := p.playbackCooldownError(); err != nil {
++		return err
++	}
++	p.prefetchKeyFailure = false
++
+ 	if p.primaryStream == nil {
++		if p.playbackFailure != nil && p.retryContext != nil {
++			if p.state.player.IsBuffering {
++				return nil
++			}
++			p.state.setPaused(false)
++			p.state.player.IsPlaying = true
++			p.state.player.IsBuffering = true
++			p.state.player.PlaybackSpeed = 0
++			p.updateState()
++			p.retryContext()
++			return nil
++		}
++		if p.playbackFailure != nil && p.state.player.Track != nil && !p.loadInFlight {
++			p.loadCurrentTrack(false, true, false, 0, func(err error) {
++				if err != nil {
++					p.app.log.WithError(err).Warn("failed retrying current track")
++				}
++			})
++			return nil
++		}
+ 		// Asked for during a load: record it so the track starts playing when
+ 		// it lands, rather than losing the command.
+ 		if p.loadInFlight {
+@@ -1237,6 +1325,7 @@ func (p *AppPlayer) play() error {
  	p.state.player.Timestamp = time.Now().UnixMilli()
  	p.state.player.PositionAsOfTimestamp = streamPos
  	p.state.setPaused(false)
@@ -193,10 +1075,94 @@ index 27f3dd1..e270f58 100644
  	p.updateState()
  	p.schedulePrefetchNext()
  
-@@ -1665,6 +1671,7 @@ func (p *AppPlayer) volumeUpdated() {
+@@ -1337,6 +1426,14 @@ func (p *AppPlayer) noteSkip() time.Duration {
+ }
+ 
+ func (p *AppPlayer) skipPrev(allowSeeking bool) error {
++	if p.playbackFailure != nil && p.state.tracks == nil {
++		return ErrNoContext
++	}
++	if err := p.playbackCooldownError(); err != nil {
++		return err
++	}
++	p.prefetchKeyFailure = false
++
+ 	// The position read here belongs to the stream on its way out while a load
+ 	// is outstanding: a second press means the track before it, not a restart.
+ 	if allowSeeking && !p.loadInFlight && p.player.PositionMs() > 3000 {
+@@ -1379,6 +1476,14 @@ func (p *AppPlayer) skipPrev(allowSeeking bool) error {
+ }
+ 
+ func (p *AppPlayer) skipNext(track *connectpb.ContextTrack) error {
++	if p.playbackFailure != nil && p.state.tracks == nil {
++		return ErrNoContext
++	}
++	if err := p.playbackCooldownError(); err != nil {
++		return err
++	}
++	p.prefetchKeyFailure = false
++
+ 	p.sess.Events().OnPlayerSkipForward(p.primaryStream, p.player.PositionMs(), track != nil)
+ 
+ 	delay := p.noteSkip()
+@@ -1440,7 +1545,7 @@ func (p *AppPlayer) skipNext(track *connectpb.ContextTrack) error {
+ 	return nil
+ }
+ 
+-// maxConsecutiveUnplayableSkips caps how many refused/restricted tracks advanceNext will skip
++// maxConsecutiveUnplayableSkips caps how many restricted tracks advanceNext will skip
+ // past in a row before stopping, so a fully-gated context can't loop forever.
+ const maxConsecutiveUnplayableSkips = 50
+ 
+@@ -1449,6 +1554,11 @@ const maxConsecutiveUnplayableSkips = 50
+ // by maxConsecutiveUnplayableSkips so a fully gated context cannot loop forever.
+ // delay holds back the load it ends in, see loadCurrentTrack.
+ func (p *AppPlayer) advanceNext(forceNext, drop bool, delay time.Duration, then func(hasNextTrack bool, err error)) {
++	if err := p.playbackCooldownError(); err != nil {
++		then(false, err)
++		return
++	}
++
+ 	if p.state.tracks == nil {
+ 		p.advanceTo(false, nil, drop, delay, then)
+ 		return
+@@ -1519,11 +1629,7 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
+ 		p.state.player.IsBuffering = false
+ 	}
+ 
+-	// BAND-AID: Spotify makes a per-track, context-dependent decision on granting the legacy
+-	// AES audio key. License-gated tracks are refused (AesKeyError, e.g. code 1) in ordinary
+-	// playlist playback — even though they play on official clients, which establish a licensed
+-	// context. We cannot decrypt a refused track, so skip it instead of freezing the player.
+-	// Remove once proper key licensing (PlayPlay) is implemented — tracked separately.
++	// Skip only positively identified track restrictions or unsupported formats.
+ 	p.loadCurrentTrack(!hasNextTrack, drop, true, delay, func(err error) {
+ 		if err == nil {
+ 			p.consecutiveUnplayableSkips = 0
+@@ -1537,15 +1643,10 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
+ 			return
+ 		}
+ 
+-		var keyErr *audio.KeyProviderError
+-		if errors.As(err, &keyErr) {
+-			p.app.log.WithError(err).Warnf("skipping track: Spotify refused the audio key (code %d) for this playback context: %s", keyErr.Code, uri)
+-		} else {
+-			p.app.log.WithError(err).Infof("skipping unplayable media: %s", uri)
+-		}
++		p.app.log.WithError(err).Infof("skipping unplayable media: %s", uri)
+ 
+ 		// Walk forward through a run of unplayable tracks (a context whose first — or several —
+-		// tracks are refused), bounded so a fully gated or RepeatingContext context advances to
++		// tracks are restricted), bounded so a fully gated or RepeatingContext context advances to
+ 		// the first playable track instead of freezing, and can never recurse forever.
+ 		p.consecutiveUnplayableSkips++
+ 		if p.consecutiveUnplayableSkips > maxConsecutiveUnplayableSkips {
+@@ -1665,6 +1766,9 @@ func (p *AppPlayer) volumeUpdated() {
  }
  
  func (p *AppPlayer) stopPlayback() {
++	p.retryContext = nil
++	p.recoverySelecting = false
 +	p.djPlayback = nil
  	// Whatever is being loaded is not wanted any more. Cancel it, and make
  	// sure a result that lands anyway is thrown away rather than published
@@ -471,7 +1437,7 @@ index 0000000..ff905d3
 +}
 diff --git a/daemon/dj_context_test.go b/daemon/dj_context_test.go
 new file mode 100644
-index 0000000..a512d0e
+index 0000000..a4c4d3d
 --- /dev/null
 +++ b/daemon/dj_context_test.go
 @@ -0,0 +1,132 @@
@@ -601,11 +1567,11 @@ index 0000000..a512d0e
 +	p.playbackReadyCh = make(chan struct{})
 +	resp, err := p.handleApiRequest(ApiRequest{Type: ApiRequestTypeRoot})
 +	require.NoError(t, err)
-+	require.Equal(t, &ApiRoot{DirectDj: true}, resp)
++	require.Equal(t, &ApiRoot{DirectDj: true, Library: true}, resp)
 +	close(p.playbackReadyCh)
 +	resp, err = p.handleApiRequest(ApiRequest{Type: ApiRequestTypeRoot})
 +	require.NoError(t, err)
-+	require.Equal(t, &ApiRoot{PlaybackReady: true, DirectDj: true}, resp)
++	require.Equal(t, &ApiRoot{PlaybackReady: true, DirectDj: true, Library: true}, resp)
 +}
 diff --git a/daemon/dj_start_test.go b/daemon/dj_start_test.go
 new file mode 100644
@@ -966,21 +1932,1702 @@ index 0000000..eda477f
 +	require.NoError(t, err)
 +	require.Equal(t, cursor, state.DJCursors["account-a"])
 +}
+diff --git a/daemon/library.go b/daemon/library.go
+new file mode 100644
+index 0000000..79f544b
+--- /dev/null
++++ b/daemon/library.go
+@@ -0,0 +1,343 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"math/big"
++	"sort"
++	"strings"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	collectionpb "github.com/devgianlu/go-librespot/proto/spotify/collection/v2"
++	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"github.com/devgianlu/go-librespot/spclient"
++	"github.com/google/uuid"
++)
++
++const libraryTimeout = 25 * time.Second
++const libraryTTL = 60 * time.Second
++const maxLibraryPages = 500
++const maxLibraryItems = 150000
++
++type libraryItem struct {
++	uri     string
++	addedAt int64
++}
++
++// Each authenticated AppPlayer owns its own service. The gate serializes reads
++// and writes off the player loop; slots bound pending calls. No collection
++// cache or captured session is shared across accounts.
++type libraryService struct {
++	username string
++	page     func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error)
++	write    func(context.Context, *collectionpb.WriteRequest) error
++	meta     *metaFetcher
++	now      func() time.Time
++	items    []libraryItem
++	fetched  time.Time
++	gate     chan struct{}
++	slots    chan struct{}
++}
++
++func newLibraryService(username string, sp *spclient.Spclient, log librespot.Logger) *libraryService {
++	// Playback caches transformed metadata after relinking: the alternative
++	// GID/files replace the originals, but their country restrictions remain.
++	// Keep raw metadata separately so browsing never interprets that mixed
++	// record as proof that a successfully playing song is unavailable.
++	meta := newMetaFetcher(log, newTrackMetaCache(), sp)
++	return &libraryService{username: username, page: sp.CollectionPage, write: sp.CollectionWrite,
++		meta: meta, now: time.Now, gate: make(chan struct{}, 1), slots: make(chan struct{}, 4)}
++}
++
++func validLibraryURI(uri string) bool {
++	if !strings.HasPrefix(uri, "spotify:track:") || len(uri) != len("spotify:track:")+22 {
++		return false
++	}
++	for _, c := range strings.TrimPrefix(uri, "spotify:track:") {
++		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
++			return false
++		}
++	}
++	value, ok := new(big.Int).SetString(strings.TrimPrefix(uri, "spotify:track:"), 62)
++	return ok && value.BitLen() <= 128
++}
++
++func (s *libraryService) lock(ctx context.Context) error {
++	select {
++	case s.gate <- struct{}{}:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++func (s *libraryService) unlock() { <-s.gate }
++
++func (s *libraryService) snapshot(ctx context.Context, refresh bool) ([]libraryItem, error) {
++	if err := s.lock(ctx); err != nil {
++		return nil, err
++	}
++	defer s.unlock()
++	return s.snapshotLocked(ctx, refresh)
++}
++
++func (s *libraryService) snapshotLocked(ctx context.Context, refresh bool) ([]libraryItem, error) {
++	if !refresh && !s.fetched.IsZero() && s.now().Sub(s.fetched) < libraryTTL {
++		return s.items, nil
++	}
++	found := make(map[string]libraryItem)
++	token := ""
++	seen := make(map[string]bool)
++	count := 0
++	for pageNo := 0; pageNo < maxLibraryPages; pageNo++ {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		page, err := s.page(ctx, &collectionpb.PageRequest{Username: s.username, Set: "collection", PaginationToken: token, Limit: 300})
++		if err != nil {
++			return nil, fmt.Errorf("reading liked songs: %w", err)
++		}
++		if page == nil {
++			return nil, errors.New("Spotify returned an invalid collection page")
++		}
++		count += len(page.Items)
++		if count > maxLibraryItems {
++			return nil, errors.New("Spotify collection exceeded the item limit")
++		}
++		for _, item := range page.Items {
++			if item == nil || !validLibraryURI(item.Uri) {
++				continue
++			}
++			if item.IsRemoved {
++				delete(found, item.Uri)
++				continue
++			}
++			found[item.Uri] = libraryItem{uri: item.Uri, addedAt: item.AddedAt}
++		}
++		token = page.NextPageToken
++		if token == "" {
++			items := make([]libraryItem, 0, len(found))
++			for _, item := range found {
++				items = append(items, item)
++			}
++			sort.Slice(items, func(i, j int) bool {
++				if items[i].addedAt != items[j].addedAt {
++					return items[i].addedAt > items[j].addedAt
++				}
++				return items[i].uri < items[j].uri
++			})
++			s.items, s.fetched = items, s.now()
++			return items, nil
++		}
++		if len(token) > 16384 || seen[token] {
++			return nil, errors.New("Spotify returned an invalid collection cursor")
++		}
++		seen[token] = true
++	}
++	return nil, errors.New("Spotify collection exceeded the page limit")
++}
++
++func (s *libraryService) contains(ctx context.Context, uri string) (bool, error) {
++	if !validLibraryURI(uri) {
++		return false, ErrBadRequest
++	}
++	items, err := s.snapshot(ctx, false)
++	if err != nil {
++		return false, err
++	}
++	for _, item := range items {
++		if item.uri == uri {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++func (s *libraryService) setSaved(ctx context.Context, uri string, saved bool) error {
++	if !validLibraryURI(uri) {
++		return ErrBadRequest
++	}
++	if err := s.lock(ctx); err != nil {
++		return err
++	}
++	defer s.unlock()
++	// Re-read before writing so an idempotent save preserves the original added
++	// timestamp and does not move an existing like to the top of the library.
++	items, err := s.snapshotLocked(ctx, true)
++	if err != nil {
++		return err
++	}
++	var addedAt int64
++	if saved {
++		addedAt = s.now().Unix()
++		for _, item := range items {
++			if item.uri == uri {
++				addedAt = item.addedAt
++				break
++			}
++		}
++	}
++	updateID, err := uuid.NewRandom()
++	if err != nil {
++		return err
++	}
++	request := &collectionpb.WriteRequest{Username: s.username, Set: "collection",
++		ClientUpdateId: updateID.String(),
++		Items:          []*collectionpb.CollectionItem{{Uri: uri, AddedAt: addedAt, IsRemoved: !saved}}}
++	// Even a failed response can follow a successful remote write. Force a fresh
++	// read after any attempted mutation and never claim success on an error.
++	s.fetched = time.Time{}
++	if err := s.write(ctx, request); err != nil {
++		return fmt.Errorf("updating liked song: %w", err)
++	}
++	return nil
++}
++
++func libraryTrackPlayable(track *metadatapb.Track, country string) bool {
++	candidates := append([]*metadatapb.Track{track}, track.GetAlternative()...)
++	for _, candidate := range candidates {
++		// Audio files are resolved by the player through AUDIO_FILES, separately
++		// from TRACK_V4. An empty legacy File list does not forbid playback.
++		if candidate == nil {
++			continue
++		}
++		restricted := false
++		if len(country) == 2 {
++			for _, restriction := range candidate.Restriction {
++				if restriction == nil {
++					continue
++				}
++				contains := func(countries string) bool {
++					for i := 0; i+1 < len(countries); i += 2 {
++						if strings.EqualFold(countries[i:i+2], country) {
++							return true
++						}
++					}
++					return false
++				}
++				switch r := restriction.CountryRestriction.(type) {
++				case *metadatapb.Restriction_CountriesAllowed:
++					restricted = !contains(r.CountriesAllowed)
++				case *metadatapb.Restriction_CountriesForbidden:
++					restricted = contains(r.CountriesForbidden)
++				}
++				if restricted {
++					break
++				}
++			}
++		}
++		if !restricted {
++			return true
++		}
++	}
++	return false
++}
++
++func (s *libraryService) tracks(ctx context.Context, offset, limit int, refresh bool, country string) (*ApiLibraryTracks, error) {
++	if offset < 0 || limit < 1 || limit > 100 {
++		return nil, ErrBadRequest
++	}
++	items, err := s.snapshot(ctx, refresh)
++	if err != nil {
++		return nil, err
++	}
++	response := &ApiLibraryTracks{Items: make([]ApiLibraryTrack, 0), Offset: offset, Limit: limit, Total: len(items)}
++	if offset >= len(items) {
++		return response, nil
++	}
++	end := offset + min(limit, len(items)-offset)
++	response.HasNext = end < len(items)
++	uris := make([]string, 0, end-offset)
++	for _, item := range items[offset:end] {
++		uris = append(uris, item.uri)
++	}
++	missing := s.meta.cache.missing(uris)
++	if len(missing) > 0 {
++		if _, err := s.meta.fetchBatch(ctx, missing); err != nil {
++			return nil, fmt.Errorf("reading liked-song metadata: %w", err)
++		}
++	}
++	for _, uri := range uris {
++		entry := ApiLibraryTrack{Uri: uri, Name: "Unavailable track", ArtistNames: []string{}}
++		if media := s.meta.cache.get(uri); media != nil && media.IsTrack() {
++			track := media.Track()
++			if track.GetName() != "" {
++				entry.Name = track.GetName()
++			}
++			entry.AlbumName = track.GetAlbum().GetName()
++			entry.Duration = int(track.GetDuration())
++			for _, artist := range track.Artist {
++				if artist.GetName() != "" {
++					entry.ArtistNames = append(entry.ArtistNames, artist.GetName())
++				}
++			}
++			entry.Playable = libraryTrackPlayable(track, country)
++		}
++		response.Items = append(response.Items, entry)
++	}
++	return response, nil
++}
++
++func (p *AppPlayer) handleLibraryRequest(req ApiRequest) (any, error) {
++	username := p.sess.Username()
++	var expected string
++	switch data := req.Data.(type) {
++	case GetLibraryTracksParams:
++		if data.Username != nil {
++			expected = *data.Username
++		}
++	case GetLibraryContainsParams:
++		expected = data.Username
++	case ApiLibrarySave:
++		expected = data.Username
++	}
++	if expected != "" && expected != username {
++		return nil, ErrConflictAccount
++	}
++	if req.Type == ApiRequestTypeLibrarySave && expected == "" {
++		return nil, ErrBadRequest
++	}
++	if p.library == nil {
++		p.library = newLibraryService(username, p.sess.Spclient(), p.app.log)
++	}
++	service := p.library
++	select {
++	case service.slots <- struct{}{}:
++	default:
++		return nil, ErrTooManyRequests
++	}
++	reply := apiReply(req)
++	country := p.CountryCode()
++	p.goDetached(libraryTimeout, func(ctx context.Context) {
++		defer func() { <-service.slots }()
++		var result any
++		var err error
++		switch req.Type {
++		case ApiRequestTypeLibraryTracks:
++			data := req.Data.(GetLibraryTracksParams)
++			offset, limit, refresh := 0, 20, false
++			if data.Offset != nil {
++				offset = *data.Offset
++			}
++			if data.Limit != nil {
++				limit = *data.Limit
++			}
++			if data.Refresh != nil {
++				refresh = *data.Refresh
++			}
++			result, err = service.tracks(ctx, offset, limit, refresh, country)
++		case ApiRequestTypeLibraryContains:
++			data := req.Data.(GetLibraryContainsParams)
++			var saved bool
++			saved, err = service.contains(ctx, data.Uri)
++			result = &ApiLibrarySaved{Saved: saved}
++		case ApiRequestTypeLibrarySave:
++			data := req.Data.(ApiLibrarySave)
++			err = service.setSaved(ctx, data.Uri, data.Saved)
++			result = &ApiLibrarySaved{Saved: data.Saved}
++		}
++		reply.done(result, err)
++	})
++	return nil, errReplyDeferred
++}
+diff --git a/daemon/library_api_test.go b/daemon/library_api_test.go
+new file mode 100644
+index 0000000..198e6cd
+--- /dev/null
++++ b/daemon/library_api_test.go
+@@ -0,0 +1,74 @@
++package daemon
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/stretchr/testify/require"
++)
++
++func TestLibrarySaveRejectsMissingOrInvalidFields(t *testing.T) {
++	uri := "spotify:track:0000000000000000000001"
++	for _, body := range []string{
++		`{}`, `{"uri":"` + uri + `","username":"account"}`,
++		`{"uri":"` + uri + `","username":"account","saved":null}`,
++		`{"uri":"` + uri + `","username":"account","saved":"false"}`,
++		`{"uri":"` + uri + `","saved":false}`,
++		`{"uri":"spotify:track:zzzzzzzzzzzzzzzzzzzzzz","username":"account","saved":false}`,
++		`{"uri":"spotify:album:0000000000000000000001","username":"account","saved":true}`,
++	} {
++		s := &ConcreteApiServer{requests: make(chan ApiRequest, 1)}
++		recorder := httptest.NewRecorder()
++		s.SaveLibraryTrack(recorder, httptest.NewRequest(http.MethodPost, "/library/save", strings.NewReader(body)))
++		require.Equal(t, http.StatusBadRequest, recorder.Code)
++		require.Empty(t, s.requests, "invalid payload must not reach player or mutate the library")
++	}
++}
++func TestLibraryRoutesPreserveExplicitFalseAndAccount(t *testing.T) {
++	cases := []struct {
++		method, path, body string
++		kind               ApiRequestType
++	}{
++		{"POST", "/library/save", `{"uri":"spotify:track:0000000000000000000001","username":"account","saved":false}`, ApiRequestTypeLibrarySave},
++		{"GET", "/library/contains?uri=spotify:track:0000000000000000000001&username=account", "", ApiRequestTypeLibraryContains},
++		{"GET", "/library/tracks?offset=20&limit=20&username=account&refresh=true", "", ApiRequestTypeLibraryTracks},
++	}
++	for _, tc := range cases {
++		t.Run(string(tc.kind), func(t *testing.T) {
++			s := &ConcreteApiServer{log: &librespot.NullLogger{}, requests: make(chan ApiRequest, 1)}
++			received := make(chan ApiRequest, 1)
++			go func() { req := <-s.requests; received <- req; req.Reply(&ApiLibrarySaved{Saved: false}, nil) }()
++			recorder := httptest.NewRecorder()
++			Handler(s).ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)))
++			require.Equal(t, http.StatusOK, recorder.Code)
++			req := <-received
++			require.Equal(t, tc.kind, req.Type)
++			switch data := req.Data.(type) {
++			case ApiLibrarySave:
++				require.False(t, data.Saved)
++				require.Equal(t, "account", data.Username)
++			case GetLibraryContainsParams:
++				require.Equal(t, "account", data.Username)
++			case GetLibraryTracksParams:
++				require.Equal(t, "account", *data.Username)
++				require.Equal(t, 20, *data.Offset)
++				require.True(t, *data.Refresh)
++			default:
++				t.Fatalf("unexpected payload type %T", data)
++			}
++		})
++	}
++}
++func TestLibraryResponseJSONHasStableEmptyArraysAndCapability(t *testing.T) {
++	page := ApiLibraryTracks{Items: []ApiLibraryTrack{}, Limit: 20}
++	raw, err := json.Marshal(page)
++	require.NoError(t, err)
++	require.JSONEq(t, `{"items":[],"offset":0,"limit":20,"total":0,"has_next":false}`, string(raw))
++	raw, err = json.Marshal(ApiRoot{Library: true, DirectDj: true})
++	require.NoError(t, err)
++	require.JSONEq(t, `{"library":true,"direct_dj":true,"playback_ready":false}`, string(raw))
++}
+diff --git a/daemon/library_relink_test.go b/daemon/library_relink_test.go
+new file mode 100644
+index 0000000..4bcab85
+--- /dev/null
++++ b/daemon/library_relink_test.go
+@@ -0,0 +1,101 @@
++package daemon
++
++import (
++	"context"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	collectionpb "github.com/devgianlu/go-librespot/proto/spotify/collection/v2"
++	extmetadatapb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
++	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/anypb"
++)
++
++func TestLibraryPlayableDoesNotRequireLegacyTrackFiles(t *testing.T) {
++	allowed := func(countries string) []*metadatapb.Restriction {
++		return []*metadatapb.Restriction{{CountryRestriction: &metadatapb.Restriction_CountriesAllowed{CountriesAllowed: countries}}}
++	}
++	for _, tc := range []struct {
++		name     string
++		track    *metadatapb.Track
++		playable bool
++	}{
++		{"unrestricted metadata without files", &metadatapb.Track{}, true},
++		{"allowed metadata without files", &metadatapb.Track{Restriction: allowed("CZUS")}, true},
++		{"allowed alternative without files", &metadatapb.Track{
++			Restriction: allowed("US"),
++			Alternative: []*metadatapb.Track{nil, {Restriction: allowed("CZ")}},
++		}, true},
++		{"all candidates restricted", &metadatapb.Track{
++			Restriction: allowed("US"),
++			Alternative: []*metadatapb.Track{{Restriction: allowed("GB")}},
++		}, false},
++		{"missing track", nil, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			// Playback resolves audio separately through AUDIO_FILES; TRACK_V4
++			// does not have to include the legacy file list.
++			require.Equal(t, tc.playable, libraryTrackPlayable(tc.track, "CZ"))
++		})
++	}
++}
++
++func TestLibraryFetchesRawMetadataAfterPlaybackRelinking(t *testing.T) {
++	uri := libraryTestURI(1)
++	id, err := librespot.SpotifyIdFromUri(uri)
++	require.NoError(t, err)
++	altID, err := librespot.SpotifyIdFromUri(libraryTestURI(2))
++	require.NoError(t, err)
++	alternative := &metadatapb.Track{
++		Gid:         altID.Id(),
++		File:        []*metadatapb.AudioFile{{Format: metadatapb.AudioFile_OGG_VORBIS_160.Enum()}},
++		Restriction: []*metadatapb.Restriction{{CountryRestriction: &metadatapb.Restriction_CountriesAllowed{CountriesAllowed: "CZ"}}},
++	}
++	raw := &metadatapb.Track{
++		Gid:         id.Id(),
++		Name:        proto.String("Playable through an alternative"),
++		Restriction: []*metadatapb.Restriction{{CountryRestriction: &metadatapb.Restriction_CountriesAllowed{CountriesAllowed: "US"}}},
++		Alternative: []*metadatapb.Track{alternative},
++	}
++	// getUnrestrictedTrack preserves the original restrictions while copying
++	// the chosen alternative's audio and clearing the alternatives. The player
++	// then caches that transformed track under the originally requested URI.
++	relinked := proto.Clone(raw).(*metadatapb.Track)
++	relinked.Alternative = nil
++	relinked.Gid = alternative.Gid
++	relinked.File = alternative.File
++	relinked.Preview = alternative.Preview
++	relinked.OriginalAudio = alternative.OriginalAudio
++	playbackCache := newTrackMetaCache()
++	playbackCache.putStream(uri, librespot.NewMediaFromTrack(relinked))
++	require.False(t, libraryTrackPlayable(playbackCache.get(uri).Track(), "CZ"), "the playback cache cannot establish the original track's availability")
++
++	service := newLibraryService("test-account", nil, &librespot.NullLogger{})
++	service.page = func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		return &collectionpb.PageResponse{Items: []*collectionpb.CollectionItem{{Uri: uri}}}, nil
++	}
++	metadataCalls := 0
++	service.meta.fetch = func(_ context.Context, req *extmetadatapb.BatchedEntityRequest) (*extmetadatapb.BatchedExtensionResponse, error) {
++		metadataCalls++
++		require.Len(t, req.EntityRequest, 1)
++		require.Equal(t, uri, req.EntityRequest[0].EntityUri)
++		payload, err := anypb.New(raw)
++		require.NoError(t, err)
++		return &extmetadatapb.BatchedExtensionResponse{ExtendedMetadata: []*extmetadatapb.EntityExtensionDataArray{{
++			ExtensionKind: extmetadatapb.ExtensionKind_TRACK_V4,
++			ExtensionData: []*extmetadatapb.EntityExtensionData{{
++				Header: &extmetadatapb.EntityExtensionDataHeader{StatusCode: 200}, EntityUri: uri, ExtensionData: payload,
++			}},
++		}}}, nil
++	}
++	page, err := service.tracks(context.Background(), 0, 20, false, "CZ")
++	require.NoError(t, err)
++	require.Equal(t, 1, metadataCalls)
++	require.Len(t, page.Items, 1)
++	require.True(t, page.Items[0].Playable)
++	require.Equal(t, uri, page.Items[0].Uri)
++	require.True(t, proto.Equal(raw, service.meta.cache.get(uri).Track()))
++	require.True(t, proto.Equal(relinked, playbackCache.get(uri).Track()), "the library must not replace playback metadata")
++}
+diff --git a/daemon/library_test.go b/daemon/library_test.go
+new file mode 100644
+index 0000000..dff405e
+--- /dev/null
++++ b/daemon/library_test.go
+@@ -0,0 +1,337 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	collectionpb "github.com/devgianlu/go-librespot/proto/spotify/collection/v2"
++	"github.com/google/uuid"
++)
++
++func libraryTestURI(number int) string {
++	return fmt.Sprintf("spotify:track:%022d", number)
++}
++
++func libraryFixture(t *testing.T) (*libraryService, *time.Time) {
++	t.Helper()
++	now := time.Unix(10000, 0)
++	service := &libraryService{
++		username: "test-user", now: func() time.Time { return now },
++		gate: make(chan struct{}, 1), slots: make(chan struct{}, 4),
++		page: func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++			t.Error("unexpected collection read")
++			return nil, errors.New("unexpected read")
++		},
++		write: func(context.Context, *collectionpb.WriteRequest) error {
++			t.Error("unexpected collection write")
++			return errors.New("unexpected write")
++		},
++	}
++	return service, &now
++}
++
++func TestLibrarySnapshotPagesFilterTombstonesAndSort(t *testing.T) {
++	service, now := libraryFixture(t)
++	pages := []*collectionpb.PageResponse{
++		{Items: []*collectionpb.CollectionItem{
++			{Uri: libraryTestURI(1), AddedAt: 10},
++			{Uri: libraryTestURI(2), AddedAt: 20},
++			{Uri: "spotify:album:" + strings.Repeat("0", 22), AddedAt: 90},
++			{Uri: "spotify:episode:" + strings.Repeat("0", 22), AddedAt: 80},
++			{Uri: "spotify:local:artist:album:song:123", AddedAt: 70},
++			{Uri: "spotify:track:bad", AddedAt: 60}, nil,
++		}, NextPageToken: "second"},
++		{Items: []*collectionpb.CollectionItem{
++			{Uri: libraryTestURI(1), IsRemoved: true},
++			{Uri: libraryTestURI(2), AddedAt: 25},
++			{Uri: libraryTestURI(4), AddedAt: 30},
++		}, NextPageToken: "third"},
++		{Items: []*collectionpb.CollectionItem{
++			{Uri: libraryTestURI(3), AddedAt: 30},
++			{Uri: libraryTestURI(9), IsRemoved: true},
++		}},
++	}
++	var tokens []string
++	service.page = func(_ context.Context, request *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		if request.Username != "test-user" || request.Set != "collection" || request.Limit != 300 {
++			t.Errorf("incorrect collection request: %#v", request)
++		}
++		index := len(tokens)
++		tokens = append(tokens, request.PaginationToken)
++		if index >= len(pages) {
++			t.Fatal("unexpected extra page")
++		}
++		return pages[index], nil
++	}
++	got, err := service.snapshot(context.Background(), false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := []libraryItem{{uri: libraryTestURI(3), addedAt: 30}, {uri: libraryTestURI(4), addedAt: 30}, {uri: libraryTestURI(2), addedAt: 25}}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("got %#v, want %#v", got, want)
++	}
++	if !reflect.DeepEqual(tokens, []string{"", "second", "third"}) {
++		t.Fatalf("wrong page tokens: %#v", tokens)
++	}
++	if !service.fetched.Equal(*now) {
++		t.Fatal("complete scan was not cached")
++	}
++}
++
++func TestLibrarySnapshotCachesForSixtySecondsAndSupportsRefresh(t *testing.T) {
++	service, now := libraryFixture(t)
++	calls := 0
++	service.page = func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		calls++
++		return &collectionpb.PageResponse{Items: []*collectionpb.CollectionItem{{Uri: libraryTestURI(calls)}}}, nil
++	}
++	get := func(refresh bool, expectedCalls int) {
++		t.Helper()
++		if _, err := service.snapshot(context.Background(), refresh); err != nil {
++			t.Fatal(err)
++		}
++		if calls != expectedCalls {
++			t.Fatalf("read count %d, want %d", calls, expectedCalls)
++		}
++	}
++	get(false, 1)
++	*now = now.Add(59 * time.Second)
++	get(false, 1)
++	*now = now.Add(time.Second)
++	get(false, 2)
++	get(true, 3)
++	get(false, 3)
++}
++
++func TestLibraryEmptySnapshotContainsAndFirstSave(t *testing.T) {
++	service, _ := libraryFixture(t)
++	reads, writes := 0, 0
++	service.page = func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		reads++
++		return &collectionpb.PageResponse{}, nil
++	}
++	service.write = func(_ context.Context, request *collectionpb.WriteRequest) error {
++		writes++
++		if len(request.Items) != 1 || request.Items[0].Uri != libraryTestURI(1) || request.Items[0].IsRemoved {
++			t.Fatalf("incorrect first save: %#v", request)
++		}
++		return nil
++	}
++	items, err := service.snapshot(context.Background(), false)
++	if err != nil || len(items) != 0 || service.fetched.IsZero() {
++		t.Fatalf("empty collection not complete: %#v %v", items, err)
++	}
++	saved, err := service.contains(context.Background(), libraryTestURI(1))
++	if saved || err != nil || reads != 1 {
++		t.Fatalf("empty contains: saved=%v err=%v reads=%d", saved, err, reads)
++	}
++	if err := service.setSaved(context.Background(), libraryTestURI(1), true); err != nil {
++		t.Fatal(err)
++	}
++	if writes != 1 || reads != 2 || !service.fetched.IsZero() {
++		t.Fatal("first save did not re-read and invalidate")
++	}
++}
++
++func TestLibraryPartialReadFailureNeverPublishesPartialCollection(t *testing.T) {
++	service, now := libraryFixture(t)
++	old := []libraryItem{{uri: libraryTestURI(1), addedAt: 1}}
++	service.items = old
++	service.fetched = now.Add(-libraryTTL)
++	oldFetched := service.fetched
++	failure := errors.New("page failed")
++	service.page = func(_ context.Context, request *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		if request.PaginationToken == "" {
++			return &collectionpb.PageResponse{Items: []*collectionpb.CollectionItem{{Uri: libraryTestURI(2), AddedAt: 2}}, NextPageToken: "next"}, nil
++		}
++		return nil, failure
++	}
++	items, err := service.snapshot(context.Background(), false)
++	if items != nil || !errors.Is(err, failure) {
++		t.Fatalf("partial read returned %#v, %v", items, err)
++	}
++	if !reflect.DeepEqual(service.items, old) || !service.fetched.Equal(oldFetched) {
++		t.Fatal("failed page published partial cache")
++	}
++	// Even finding the requested URI on an early page cannot establish the
++	// final saved state: a later page could contain its tombstone.
++	saved, err := service.contains(context.Background(), libraryTestURI(2))
++	if saved || !errors.Is(err, failure) {
++		t.Fatalf("contains suppressed scan failure: saved=%v err=%v", saved, err)
++	}
++	service.page = func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		return &collectionpb.PageResponse{Items: []*collectionpb.CollectionItem{{Uri: libraryTestURI(3), AddedAt: 3}}}, nil
++	}
++	items, err = service.snapshot(context.Background(), false)
++	if err != nil || len(items) != 1 || items[0].uri != libraryTestURI(3) {
++		t.Fatalf("retry did not replace stale cache: %#v %v", items, err)
++	}
++}
++
++func TestLibrarySnapshotRejectsCyclesMalformedPagesAndBounds(t *testing.T) {
++	tests := []struct {
++		name  string
++		page  func(int) *collectionpb.PageResponse
++		calls int
++	}{
++		{"cycle", func(int) *collectionpb.PageResponse { return &collectionpb.PageResponse{NextPageToken: "same"} }, 2},
++		{"long cursor", func(int) *collectionpb.PageResponse {
++			return &collectionpb.PageResponse{NextPageToken: strings.Repeat("x", 16385)}
++		}, 1},
++		{"nil page", func(int) *collectionpb.PageResponse { return nil }, 1},
++		{"page limit", func(index int) *collectionpb.PageResponse {
++			return &collectionpb.PageResponse{NextPageToken: fmt.Sprint(index)}
++		}, maxLibraryPages},
++		{"raw item limit", func(int) *collectionpb.PageResponse {
++			return &collectionpb.PageResponse{Items: make([]*collectionpb.CollectionItem, maxLibraryItems+1)}
++		}, 1},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			service, _ := libraryFixture(t)
++			calls := 0
++			service.page = func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++				calls++
++				return test.page(calls), nil
++			}
++			items, err := service.snapshot(context.Background(), false)
++			if err == nil || items != nil || !service.fetched.IsZero() {
++				t.Fatalf("invalid scan became complete: %#v %v", items, err)
++			}
++			if calls != test.calls {
++				t.Fatalf("read count %d, want %d", calls, test.calls)
++			}
++		})
++	}
++}
++
++func TestLibrarySaveWireFieldsAndExistingTimestamp(t *testing.T) {
++	service, now := libraryFixture(t)
++	reads := 0
++	service.page = func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		reads++
++		return &collectionpb.PageResponse{Items: []*collectionpb.CollectionItem{{Uri: libraryTestURI(1), AddedAt: 1234}}}, nil
++	}
++	var writes []*collectionpb.WriteRequest
++	service.write = func(_ context.Context, request *collectionpb.WriteRequest) error {
++		writes = append(writes, request)
++		return nil
++	}
++	for _, change := range []struct {
++		uri   string
++		saved bool
++	}{
++		{libraryTestURI(2), true}, {libraryTestURI(1), true}, {libraryTestURI(1), false},
++	} {
++		if err := service.setSaved(context.Background(), change.uri, change.saved); err != nil {
++			t.Fatal(err)
++		}
++		if !service.fetched.IsZero() {
++			t.Fatal("write did not invalidate collection cache")
++		}
++	}
++	if reads != 3 || len(writes) != 3 {
++		t.Fatalf("reads=%d writes=%d, want three each", reads, len(writes))
++	}
++	ids := make(map[string]bool)
++	for index, request := range writes {
++		if request.Username != "test-user" || request.Set != "collection" || len(request.Items) != 1 {
++			t.Fatalf("write routing/arity wrong: %#v", request)
++		}
++		id, err := uuid.Parse(request.ClientUpdateId)
++		if err != nil || id.Version() != 4 || id.Variant() != uuid.RFC4122 || ids[request.ClientUpdateId] {
++			t.Fatal("mutation ID missing or reused")
++		}
++		ids[request.ClientUpdateId] = true
++		item := request.Items[0]
++		wantURI := libraryTestURI(1)
++		wantAddedAt := int64(1234)
++		if index == 0 {
++			wantURI, wantAddedAt = libraryTestURI(2), now.Unix()
++		}
++		if index == 2 {
++			wantAddedAt = 0
++		}
++		if item.Uri != wantURI || item.AddedAt != wantAddedAt || item.IsRemoved != (index == 2) || item.ContextUri != nil {
++			t.Fatalf("write %d got %#v, want URI=%s timestamp=%d removed=%v", index, item, wantURI, wantAddedAt, index == 2)
++		}
++	}
++}
++
++func TestLibraryAmbiguousWriteFailureForcesFreshRead(t *testing.T) {
++	service, _ := libraryFixture(t)
++	failure := errors.New("response lost after write")
++	applied := false
++	reads := 0
++	service.page = func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		reads++
++		response := &collectionpb.PageResponse{}
++		if applied {
++			response.Items = []*collectionpb.CollectionItem{{Uri: libraryTestURI(1), AddedAt: 77}}
++		}
++		return response, nil
++	}
++	service.write = func(context.Context, *collectionpb.WriteRequest) error { applied = true; return failure }
++	if err := service.setSaved(context.Background(), libraryTestURI(1), true); !errors.Is(err, failure) {
++		t.Fatalf("write error lost: %v", err)
++	}
++	if !service.fetched.IsZero() {
++		t.Fatal("ambiguous write kept authoritative cache")
++	}
++	saved, err := service.contains(context.Background(), libraryTestURI(1))
++	if err != nil || !saved || reads != 2 {
++		t.Fatalf("post-write read did not reconcile server state: saved=%v err=%v reads=%d", saved, err, reads)
++	}
++}
++
++func TestLibraryFailedPrewriteReadNeverMutates(t *testing.T) {
++	service, now := libraryFixture(t)
++	service.items, service.fetched = []libraryItem{{uri: libraryTestURI(1), addedAt: 99}}, *now
++	failure := errors.New("cannot establish current saved state")
++	service.page = func(context.Context, *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++		return nil, failure
++	}
++	if err := service.setSaved(context.Background(), libraryTestURI(1), true); !errors.Is(err, failure) {
++		t.Fatalf("expected scan error, got %v", err)
++	}
++	// The fixture's write function fails the test if called.
++}
++
++func TestLibraryRejectsInvalidTrackURIsBeforeNetwork(t *testing.T) {
++	for _, uri := range []string{"", "spotify:track:bad", "https://open.spotify.com/track/" + strings.Repeat("0", 22),
++		"spotify:episode:" + strings.Repeat("0", 22), "spotify:local:artist:album:song:123",
++		"spotify:track:" + strings.Repeat("_", 22), "spotify:track:" + strings.Repeat("0", 23),
++		"spotify:track:" + strings.Repeat("z", 22), "spotify:track:" + strings.Repeat("Z", 22)} {
++		t.Run(uri, func(t *testing.T) {
++			service, _ := libraryFixture(t)
++			if saved, err := service.contains(context.Background(), uri); saved || !errors.Is(err, ErrBadRequest) {
++				t.Fatalf("invalid contains: %v %v", saved, err)
++			}
++			for _, save := range []bool{false, true} {
++				if err := service.setSaved(context.Background(), uri, save); !errors.Is(err, ErrBadRequest) {
++					t.Fatalf("invalid save: %v", err)
++				}
++			}
++		})
++	}
++}
++
++func TestLibraryCanceledCallerDoesNotWaitForBusyGate(t *testing.T) {
++	service, _ := libraryFixture(t)
++	service.gate <- struct{}{}
++	defer func() { <-service.gate }()
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := service.snapshot(ctx, false); !errors.Is(err, context.Canceled) {
++		t.Fatalf("cancellation lost: %v", err)
++	}
++	if err := service.setSaved(ctx, libraryTestURI(1), true); !errors.Is(err, context.Canceled) {
++		t.Fatalf("mutation cancellation lost: %v", err)
++	}
++}
+diff --git a/daemon/loader.go b/daemon/loader.go
+index ec0641d..f6bc2ad 100644
+--- a/daemon/loader.go
++++ b/daemon/loader.go
+@@ -47,6 +47,27 @@ func (r replyTo) done(data any, err error) {
+ // applyLoaderResult folds a finished job back into the state. Runs on the Run
+ // goroutine, which is what makes commit safe to write state from.
+ func (p *AppPlayer) applyLoaderResult(res loaderResult) {
++	if isAudioKeyRefusal(res.err) {
++		fresh := res.gen == p.generation(res.class)
++		if res.audioKeyRetryAt.IsZero() {
++			p.loader.refuseAudioKey()
++		}
++		if p.primaryStream != nil && !p.loadInFlight && !p.state.player.IsBuffering && (res.class == classPrefetch || !fresh) {
++			p.prefetchKeyFailure = fresh && res.class == classPrefetch
++			p.prefetchGen++
++			p.prefetchTimer.Stop()
++			p.clearUpcoming()
++		} else {
++			p.stopForAudioKey()
++		}
++		if fresh && res.commit != nil {
++			res.commit(p, res.err)
++		} else if res.discard != nil {
++			res.discard()
++		}
++		res.reply.done(nil, res.err)
++		return
++	}
+ 	if res.class == classLoad && res.gen == p.loadGen {
+ 		p.loadInFlight = false
+ 
+@@ -277,10 +298,11 @@ type loaderResult struct {
+ 	class loaderClass
+ 	reply replyTo
+ 
+-	value   any
+-	err     error
+-	commit  func(p *AppPlayer, err error)
+-	discard func()
++	audioKeyRetryAt time.Time
++	value           any
++	err             error
++	commit          func(p *AppPlayer, err error)
++	discard         func()
+ }
+ 
+ type runningJob struct {
+@@ -297,10 +319,11 @@ type loaderLane struct {
+ 	ctx    context.Context
+ 	cancel context.CancelFunc
+ 
+-	mu      sync.Mutex
+-	queue   []loaderJob
+-	running *runningJob
+-	closed  bool
++	mu              sync.Mutex
++	queue           []loaderJob
++	running         *runningJob
++	closed          bool
++	audioKeyRetryAt time.Time
+ 
+ 	wake    chan struct{}
+ 	results chan loaderResult
+@@ -334,6 +357,12 @@ func (l *loaderLane) submit(job loaderJob) {
+ 		return
+ 	}
+ 
++	if job.class != classMutate && time.Now().Before(l.audioKeyRetryAt) {
++		l.mu.Unlock()
++		job.reply.done(nil, errPlaybackCooldown)
++		return
++	}
++
+ 	switch job.class {
+ 	case classLoad, classNav:
+ 		dropped = l.dropLoadsLocked()
+@@ -490,7 +519,15 @@ func (l *loaderLane) execute(job loaderJob, ctx context.Context) loaderResult {
+ 		l.mu.Unlock()
+ 	}()
+ 
+-	res := job.run(ctx)
++	var res loaderResult
++	if job.class != classMutate && l.cooldownRemaining() > 0 {
++		res.err = errPlaybackCooldown
++	} else {
++		res = job.run(ctx)
++	}
++	if isAudioKeyRefusal(res.err) {
++		res.audioKeyRetryAt = l.refuseAudioKey()
++	}
+ 	res.name = job.name
+ 	res.gen = job.gen
+ 	res.class = job.class
+diff --git a/daemon/playback_error.go b/daemon/playback_error.go
+index b8854bc..1b032f2 100644
+--- a/daemon/playback_error.go
++++ b/daemon/playback_error.go
+@@ -23,14 +23,15 @@ const (
+ // What kind of failure a playback_error was, for clients that act on it without
+ // matching error text.
+ const (
+-	playbackErrorKindRestricted  = "restricted"
+-	playbackErrorKindUnsupported = "unsupported"
+-	playbackErrorKindRateLimited = "rate_limited"
+-	playbackErrorKindRejected    = "rejected"
+-	playbackErrorKindServer      = "server"
+-	playbackErrorKindTimeout     = "timeout"
+-	playbackErrorKindNetwork     = "network"
+-	playbackErrorKindUnknown     = "unknown"
++	playbackErrorKindAudioKeyRefused = "audio_key_refused"
++	playbackErrorKindRestricted      = "restricted"
++	playbackErrorKindUnsupported     = "unsupported"
++	playbackErrorKindRateLimited     = "rate_limited"
++	playbackErrorKindRejected        = "rejected"
++	playbackErrorKindServer          = "server"
++	playbackErrorKindTimeout         = "timeout"
++	playbackErrorKindNetwork         = "network"
++	playbackErrorKindUnknown         = "unknown"
+ )
+ 
+ var errSessionLost = errors.New("lost the connection to Spotify")
+@@ -42,7 +43,9 @@ func classifyPlaybackError(err error) string {
+ 	var netErr net.Error
+ 
+ 	switch {
+-	case errors.Is(err, librespot.ErrMediaRestricted), errors.As(err, &keyErr):
++	case errors.As(err, &keyErr):
++		return playbackErrorKindAudioKeyRefused
++	case errors.Is(err, librespot.ErrMediaRestricted):
+ 		return playbackErrorKindRestricted
+ 	case errors.Is(err, librespot.ErrNoSupportedFormats):
+ 		return playbackErrorKindUnsupported
+@@ -85,6 +88,10 @@ func (p *AppPlayer) emitPlaybackError(stage, uri string, err error) {
+ 		return
+ 	}
+ 
++	message := err.Error()
++	if isAudioKeyRefusal(err) {
++		message = audioKeyFailureMessage
++	}
+ 	p.app.server.Emit(&ApiEvent{
+ 		Type: ApiEventTypePlaybackError,
+ 		Data: ApiEventDataPlaybackError{
+@@ -94,7 +101,7 @@ func (p *AppPlayer) emitPlaybackError(stage, uri string, err error) {
+ 			Stage:      stage,
+ 			Kind:       classifyPlaybackError(err),
+ 			Unplayable: isUnplayableMedia(err),
+-			Message:    err.Error(),
++			Message:    message,
+ 		},
+ 	})
+ }
+diff --git a/daemon/playback_error_test.go b/daemon/playback_error_test.go
+index 3a266e1..4a9e296 100644
+--- a/daemon/playback_error_test.go
++++ b/daemon/playback_error_test.go
+@@ -29,7 +29,8 @@ func TestClassifyPlaybackError(t *testing.T) {
+ 		want string
+ 	}{
+ 		{"restricted media", fmt.Errorf("load: %w", librespot.ErrMediaRestricted), playbackErrorKindRestricted},
+-		{"refused audio key", &audio.KeyProviderError{Code: 1}, playbackErrorKindRestricted},
++		{"refused audio key", &audio.KeyProviderError{Code: 1}, playbackErrorKindAudioKeyRefused},
++		{"opaque code 2 is not rate limiting", &audio.KeyProviderError{Code: 2}, playbackErrorKindAudioKeyRefused},
+ 		{"no supported format", librespot.ErrNoSupportedFormats, playbackErrorKindUnsupported},
+ 		{"rate limited", &spclient.RateLimitedError{}, playbackErrorKindRateLimited},
+ 		{"too many requests", status(429), playbackErrorKindRateLimited},
+diff --git a/daemon/playback_recovery.go b/daemon/playback_recovery.go
+new file mode 100644
+index 0000000..f811971
+--- /dev/null
++++ b/daemon/playback_recovery.go
+@@ -0,0 +1,156 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"github.com/devgianlu/go-librespot/audio"
++	"github.com/devgianlu/go-librespot/mpris"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++)
++
++// Audio-key error codes are opaque. A refusal says nothing reliable about a
++// track's availability or HTTP rate limiting. Stop new key requests for a
++// bounded interval and require an explicit user action to try again.
++const audioKeyCooldown = 10 * time.Second
++const audioKeyFailureMessage = "Spotify refused the audio key. Playback stopped; retry after the cooldown."
++
++var errPlaybackCooldown = errors.New("Playback is cooling down after an audio-key refusal; retry shortly.")
++
++func isAudioKeyRefusal(err error) bool {
++	var keyErr *audio.KeyProviderError
++	return errors.As(err, &keyErr)
++}
++
++func (l *loaderLane) cooldownRemaining() time.Duration {
++	if l == nil {
++		return 0
++	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	return max(0, time.Until(l.audioKeyRetryAt))
++}
++
++// Run on the loader lane before publishing its result, so even a slow player
++// loop cannot let queued navigation or another stream request through. This
++// deadline is never extended by controls or by observing the same result.
++func (l *loaderLane) refuseAudioKey() time.Time {
++	l.mu.Lock()
++	if !time.Now().Before(l.audioKeyRetryAt) {
++		l.audioKeyRetryAt = time.Now().Add(audioKeyCooldown)
++	}
++	until := l.audioKeyRetryAt
++	dropped, kept := partitionQueue(l.queue, func(job loaderJob) bool { return job.class != classMutate })
++	l.queue = kept
++	l.mu.Unlock()
++	replyAll(dropped, errPlaybackCooldown)
++	return until
++}
++
++func (p *AppPlayer) playbackCooldownError() error {
++	if p.recoverySelecting || p.loader.cooldownRemaining() > 0 {
++		return errPlaybackCooldown
++	}
++	return nil
++}
++
++func (p *AppPlayer) apiPlaybackError() *ApiPlaybackError {
++	if p.playbackFailure == nil {
++		return nil
++	}
++	out := *p.playbackFailure
++	// Round up so a positive remainder never advertises an early retry.
++	out.RetryAfterMs = int64((p.loader.cooldownRemaining() + time.Millisecond - 1) / time.Millisecond)
++	if p.recoverySelecting {
++		out.RetryAfterMs = max(1, out.RetryAfterMs)
++	}
++	return &out
++}
++
++// Keep the context, track selection and DJ continuation intact. Unlike
++// stopPlayback, failure does not relinquish the session or consume its cursor.
++func (p *AppPlayer) stopForAudioKey() {
++	p.playbackFailure = &ApiPlaybackError{
++		Kind:    playbackErrorKindAudioKeyRefused,
++		Message: audioKeyFailureMessage,
++		Uri:     p.state.player.Track.GetUri(),
++	}
++	p.holdFailedPlayback()
++}
++
++// Settle a failed manual retry without forgetting its selection or error.
++func (p *AppPlayer) holdFailedPlayback() {
++	if p.playbackFailure != nil {
++		p.playbackFailure.Uri = p.state.player.Track.GetUri()
++	}
++	p.prefetchKeyFailure = false
++	p.loadGen++
++	p.prefetchGen++
++	p.loader.dropPlayback()
++	p.loadInFlight = false
++	p.recoverySelecting = false
++	p.pendingPlayerEvents = nil
++	p.prefetchTimer.Stop()
++	p.player.Stop()
++	p.primaryStream = nil
++	p.clearUpcoming()
++	p.state.updateTimestamp()
++	p.state.player.IsPlaying = false
++	p.state.player.IsBuffering = false
++	p.state.setPaused(true)
++	p.consecutiveUnplayableSkips = 0
++	p.updateState()
++	p.emitMprisUpdate(mpris.Stopped)
++}
++
++// A healthy primary may finish before a refused prefetch's cooldown expires.
++// Move only the retry selection to its successor; never fetch media or consume
++// a DJ cursor. This explicit navigation is the one exception to dropping
++// ordinary queued controls during recovery.
++func (p *AppPlayer) stopAfterPrefetchRefusal() {
++	p.stopForAudioKey()
++	p.state.player.PositionAsOfTimestamp = 0
++	if p.state.player.Options.RepeatingTrack {
++		return
++	}
++	gen := p.loadGen
++	p.recoverySelecting = true
++	var hasNext bool
++	// An explicit empty hint avoids fetching surrounding pages just to select
++	// the retry target, which the refused prefetch already resolved.
++	p.listJob("select next after refused prefetch", classMutate, []*connectpb.ContextTrack{},
++		func(ctx context.Context, list *tracks.List) error { hasNext = list.GoNext(ctx); return nil },
++		func(p *AppPlayer, snap *tracks.Snapshot, err error) {
++			if gen != p.loadGen {
++				return
++			}
++			p.recoverySelecting = false
++			if err != nil || p.playbackFailure == nil {
++				return
++			}
++			if hasNext {
++				p.publishSnapshot(snap)
++			} else {
++				p.state.player.Track = nil
++			}
++			p.state.player.PositionAsOfTimestamp = 0
++			p.state.player.Timestamp = time.Now().UnixMilli()
++			p.playbackFailure.Uri = p.state.player.Track.GetUri()
++			p.updateState()
++		})
++}
++
++// Unlike normal supersession, a failed playback attempt abandons relative
++// navigation too: queued controls must not consume the retained selection.
++func (l *loaderLane) dropPlayback() {
++	l.mu.Lock()
++	dropped, kept := partitionQueue(l.queue, func(job loaderJob) bool { return job.class != classMutate })
++	l.queue = kept
++	if l.running != nil && l.running.class != classMutate {
++		l.running.cancel()
++	}
++	l.mu.Unlock()
++	replyAll(dropped, ErrSuperseded)
++}
+diff --git a/daemon/playback_recovery_test.go b/daemon/playback_recovery_test.go
+new file mode 100644
+index 0000000..4edf3d6
+--- /dev/null
++++ b/daemon/playback_recovery_test.go
+@@ -0,0 +1,292 @@
++//go:build test_unit
++
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/audio"
++	"github.com/devgianlu/go-librespot/dealer"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
++	"github.com/devgianlu/go-librespot/tracks"
++	"github.com/stretchr/testify/require"
++)
++
++func recoveryPlayer(t *testing.T) *AppPlayer {
++	t.Helper()
++	p := newTestAppPlayer(t)
++	p.app.cfg = &Config{DisableAutoplay: true}
++	p.app.metaCache = newTrackMetaCache()
++	p.app.state = &librespot.AppState{}
++	p.prodInfo = &ProductInfo{}
++	ctx := &connectpb.Context{Uri: djContextURI, Pages: []*connectpb.ContextPage{{
++		Tracks: []*connectpb.ContextTrack{{Uri: trackUri(1)}, {Uri: trackUri(2)}, {Uri: trackUri(3)}},
++	}}}
++	list, err := tracks.NewTrackListFromContext(t.Context(), p.app.log, nil, ctx)
++	require.NoError(t, err)
++	require.True(t, list.GoStart(t.Context()))
++	p.state.tracks = list
++	p.state.player.ContextUri = ctx.Uri
++	p.publishSnapshot(list.Snapshot(t.Context(), []*connectpb.ContextTrack{}))
++	return p
++}
++
++func expireAudioCooldown(l *loaderLane) {
++	l.mu.Lock()
++	l.audioKeyRetryAt = time.Now().Add(-time.Second)
++	l.mu.Unlock()
++}
++
++func refuseCurrentTrack(t *testing.T, p *AppPlayer) {
++	t.Helper()
++	p.streamFactory = func(context.Context, librespot.SpotifyId, int64) (*player.Stream, error) {
++		return nil, fmt.Errorf("opaque backend detail https://secret.invalid/?token=hidden: %w", &audio.KeyProviderError{Code: 2})
++	}
++	p.loadCurrentTrackOrSkip(false, true, false, func(error) {})
++	require.True(t, p.loadInFlight)
++	runQueuedJob(t, p)
++}
++
++func TestAudioKeyRefusalStopsWithoutSkippingAndPreservesDJ(t *testing.T) {
++	p := recoveryPlayer(t)
++	p.djPlayback = &djPlayback{username: "test-account", rootFingerprint: "root", pending: &djPagePosition{nextPageURL: djPageURL(1), trackURI: trackUri(1)}}
++	want := p.state.tracks
++	refuseCurrentTrack(t, p)
++	require.Same(t, want, p.state.tracks)
++	require.Equal(t, trackUri(1), p.state.player.Track.GetUri())
++	require.Equal(t, trackUri(1), p.state.tracks.Snapshot(t.Context(), []*connectpb.ContextTrack{}).Current.Uri)
++	require.False(t, p.state.player.IsPlaying)
++	require.True(t, p.state.player.IsPaused)
++	require.False(t, p.state.player.IsBuffering)
++	require.False(t, p.loadInFlight)
++	require.Empty(t, p.loader.queue, "a key refusal must not walk the collection")
++	require.Nil(t, p.app.djCursor("test-account"))
++	require.NotNil(t, p.djPlayback)
++	require.NotNil(t, p.apiPlaybackError())
++	require.Equal(t, "audio_key_refused", p.apiPlaybackError().Kind)
++	require.Greater(t, p.apiPlaybackError().RetryAfterMs, int64(0))
++	require.LessOrEqual(t, p.apiPlaybackError().RetryAfterMs, int64(10000))
++	raw, err := json.Marshal(ApiStatus{ApiPlaybackError: p.apiPlaybackError()})
++	require.NoError(t, err)
++	require.Contains(t, string(raw), `"playback_error"`)
++	require.NotContains(t, string(raw), "secret.invalid")
++	require.NotContains(t, string(raw), "hidden")
++	for _, event := range p.app.server.(*recordingApiServer).emitted {
++		if event.Type == ApiEventTypePlaybackError {
++			data := event.Data.(ApiEventDataPlaybackError)
++			require.False(t, data.Unplayable)
++			require.Equal(t, audioKeyFailureMessage, data.Message)
++		}
++	}
++	// Deferred and newly arriving old output events cannot restart or advance.
++	for _, kind := range []player.EventType{player.EventTypePlay, player.EventTypeResume, player.EventTypeNotPlaying} {
++		p.handlePlayerEvent(&player.Event{Type: kind})
++	}
++	require.False(t, p.state.player.IsPlaying)
++	require.Empty(t, p.loader.queue)
++}
++
++func TestRecoveryControlsCannotBypassOrExtendCooldown(t *testing.T) {
++	p := recoveryPlayer(t)
++	refuseCurrentTrack(t, p)
++	deadline := p.loader.audioKeyRetryAt
++	for i := 0; i < 64; i++ {
++		for _, kind := range []ApiRequestType{ApiRequestTypePlay, ApiRequestTypeResume, ApiRequestTypePlayPause, ApiRequestTypeNext, ApiRequestTypePrev} {
++			_, err := p.handleApiRequest(ApiRequest{Type: kind})
++			require.ErrorIs(t, err, errPlaybackCooldown)
++		}
++		for _, endpoint := range []string{"play", "resume", "transfer", "skip_next", "skip_prev"} {
++			req := dealer.RequestPayload{}
++			req.Command.Endpoint = endpoint
++			require.ErrorIs(t, p.handlePlayerCommand(req), errPlaybackCooldown)
++		}
++		p.prefetchNext()
++		require.ErrorIs(t, p.play(), errPlaybackCooldown)
++		require.ErrorIs(t, p.skipNext(nil), errPlaybackCooldown)
++		require.ErrorIs(t, p.skipPrev(true), errPlaybackCooldown)
++	}
++	require.Equal(t, deadline, p.loader.audioKeyRetryAt)
++	require.Empty(t, p.loader.queue)
++	require.Equal(t, trackUri(1), p.state.player.Track.Uri)
++}
++
++func TestCooldownExpiresWithoutAutomaticRetryAndManualResumeRecovers(t *testing.T) {
++	p := recoveryPlayer(t)
++	refuseCurrentTrack(t, p)
++	expireAudioCooldown(p.loader)
++	require.Zero(t, p.apiPlaybackError().RetryAfterMs)
++	require.Empty(t, p.loader.queue)
++	require.NoError(t, p.play())
++	require.True(t, p.state.player.IsBuffering)
++	require.NotNil(t, p.apiPlaybackError(), "input cannot clear the persistent error")
++	require.Len(t, p.loader.queue, 1)
++	require.Equal(t, "load "+trackUri(1), p.loader.queue[0].name)
++	// A failed retry stays stopped, on precisely the same selection.
++	runQueuedJob(t, p)
++	require.False(t, p.state.player.IsBuffering)
++	require.NotNil(t, p.apiPlaybackError())
++	require.Equal(t, trackUri(1), p.apiPlaybackError().Uri)
++	expireAudioCooldown(p.loader)
++	require.NoError(t, p.play())
++	job := p.loader.queue[0]
++	p.loader.queue = nil
++	stream := &player.Stream{RequestedId: librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, gid(1)), Media: librespot.NewMediaFromTrack(metaTrack(gid(1), "Recovered"))}
++	p.applyLoaderResult(loaderResult{class: classLoad, gen: job.gen, commit: func(p *AppPlayer, _ error) { p.commitLoad(stream, trackUri(1), false, 0, false) }})
++	require.Nil(t, p.apiPlaybackError())
++	require.True(t, p.state.player.IsPlaying)
++	require.False(t, p.state.player.IsBuffering)
++}
++
++func TestAudioKeyRefusalGatePrecedesResultAndDropsQueuedNavigation(t *testing.T) {
++	l := newTestLoaderLane()
++	ran := 0
++	job := loaderJob{class: classLoad, run: func(context.Context) loaderResult { return loaderResult{err: &audio.KeyProviderError{Code: 2}} }}
++	l.queue = []loaderJob{{class: classNav, run: func(context.Context) loaderResult { ran++; return loaderResult{} }}, {class: classLoad}, {class: classPrefetch}, {class: classMutate, run: func(context.Context) loaderResult { ran++; return loaderResult{} }}}
++	result := l.execute(job, t.Context())
++	require.True(t, isAudioKeyRefusal(result.err))
++	require.Len(t, l.queue, 1)
++	require.Equal(t, classMutate, l.queue[0].class)
++	for _, class := range []loaderClass{classLoad, classNav, classPrefetch} {
++		reply, answered := recordingReply(t)
++		l.submit(loaderJob{class: class, reply: reply, run: func(context.Context) loaderResult { ran++; return loaderResult{} }})
++		err, ok := answered()
++		require.True(t, ok)
++		require.ErrorIs(t, err, errPlaybackCooldown)
++		rejected := l.execute(loaderJob{class: class, run: func(context.Context) loaderResult { ran++; return loaderResult{} }}, t.Context())
++		require.ErrorIs(t, rejected.err, errPlaybackCooldown)
++	}
++	require.Zero(t, ran, "no request or list mutation before the player receives the failure")
++	l.execute(l.queue[0], t.Context())
++	require.Equal(t, 1, ran, "library/queue mutations remain independent")
++}
++
++func TestStaleRefusalPreservesHealthyPrimaryAndStaleSuccessCannotClearFailure(t *testing.T) {
++	p := recoveryPlayer(t)
++	healthy := playingTrack(t, p, trackUri(1), "one")
++	p.loadGen = 3
++	p.applyLoaderResult(loaderResult{class: classLoad, gen: 2, err: &audio.KeyProviderError{Code: 2}})
++	require.Same(t, healthy, p.primaryStream)
++	require.True(t, p.state.player.IsPlaying)
++	require.Nil(t, p.apiPlaybackError())
++	require.Equal(t, trackUri(1), p.state.player.Track.Uri)
++	require.Greater(t, p.loader.cooldownRemaining(), time.Duration(0))
++	p.stopForAudioKey()
++	p.applyLoaderResult(loaderResult{class: classLoad, gen: 2, commit: func(p *AppPlayer, _ error) { p.playbackFailure = nil }})
++	require.NotNil(t, p.apiPlaybackError())
++}
++
++func TestPrefetchRefusalKeepsPrimaryThenSelectsNextOnEarlyEnd(t *testing.T) {
++	for _, repeat := range []bool{false, true} {
++		t.Run(fmt.Sprint("repeat=", repeat), func(t *testing.T) {
++			p := recoveryPlayer(t)
++			healthy := playingTrack(t, p, trackUri(1), "one")
++			p.state.player.Options.RepeatingTrack = repeat
++			p.applyLoaderResult(loaderResult{class: classPrefetch, gen: p.prefetchGen, err: &audio.KeyProviderError{Code: 2}})
++			require.Same(t, healthy, p.primaryStream)
++			require.True(t, p.state.player.IsPlaying)
++			require.False(t, p.state.player.IsBuffering)
++			require.Nil(t, p.apiPlaybackError())
++			p.handlePlayerEvent(&player.Event{Type: player.EventTypeNotPlaying})
++			require.Nil(t, p.primaryStream)
++			require.False(t, p.state.player.IsBuffering)
++			want := trackUri(1)
++			if !repeat {
++				require.True(t, p.recoverySelecting)
++				expireAudioCooldown(p.loader)
++				require.ErrorIs(t, p.play(), errPlaybackCooldown, "cannot capture the old track while successor selection is pending")
++				runQueuedJob(t, p)
++				want = trackUri(2)
++			}
++			require.False(t, p.recoverySelecting)
++			require.Equal(t, want, p.state.player.Track.Uri)
++			require.Equal(t, want, p.apiPlaybackError().Uri)
++			require.Nil(t, p.app.djCursor("test-account"))
++			expireAudioCooldown(p.loader)
++			require.NoError(t, p.play())
++			require.Len(t, p.loader.queue, 1)
++			require.Equal(t, "load "+want, p.loader.queue[0].name)
++		})
++	}
++}
++
++func TestCooldownRespondsWithSafeServiceUnavailable(t *testing.T) {
++	server := &ConcreteApiServer{log: &librespot.NullLogger{}, requests: make(chan ApiRequest, 1)}
++	go func() { req := <-server.requests; req.Reply(nil, errPlaybackCooldown) }()
++	out := httptest.NewRecorder()
++	Handler(server).ServeHTTP(out, httptest.NewRequest(http.MethodPost, "/player/playpause", strings.NewReader("{}")))
++	require.Equal(t, http.StatusServiceUnavailable, out.Code)
++	require.Equal(t, errPlaybackCooldown.Error(), out.Body.String())
++}
++
++func TestOnlyPositiveMediaRestrictionsMayAutoSkip(t *testing.T) {
++	for _, code := range []uint16{1, 2, 3, 255} {
++		require.False(t, isUnplayableMedia(fmt.Errorf("load: %w", &audio.KeyProviderError{Code: code})))
++	}
++	require.True(t, isUnplayableMedia(fmt.Errorf("load: %w", librespot.ErrMediaRestricted)))
++	require.True(t, isUnplayableMedia(fmt.Errorf("load: %w", librespot.ErrNoSupportedFormats)))
++}
++
++func TestKnownRestrictionsStillAdvanceOnceBeforeOpaqueRefusalStops(t *testing.T) {
++	for _, restriction := range []error{librespot.ErrMediaRestricted, librespot.ErrNoSupportedFormats} {
++		p := recoveryPlayer(t)
++		var attempted []string
++		p.streamFactory = func(_ context.Context, id librespot.SpotifyId, _ int64) (*player.Stream, error) {
++			attempted = append(attempted, id.Uri())
++			if id.Uri() == trackUri(1) {
++				return nil, restriction
++			}
++			return nil, &audio.KeyProviderError{Code: 2}
++		}
++		p.loadCurrentTrackOrSkip(false, true, false, func(error) {})
++		runQueuedJob(t, p) // Positively restricted first track.
++		require.Nil(t, p.apiPlaybackError())
++		runQueuedJob(t, p) // Navigation to the second track.
++		runQueuedJob(t, p) // Its opaque key refusal is terminal.
++		require.Equal(t, []string{trackUri(1), trackUri(2)}, attempted)
++		require.Equal(t, trackUri(2), p.state.player.Track.Uri)
++		require.Empty(t, p.loader.queue)
++		require.NotNil(t, p.apiPlaybackError())
++	}
++}
++
++func TestCanceledLoadDoesNotArmAudioCooldown(t *testing.T) {
++	p := recoveryPlayer(t)
++	p.loadGen = 2
++	p.applyLoaderResult(p.loader.execute(loaderJob{class: classLoad, gen: 1, run: func(context.Context) loaderResult { return loaderResult{err: context.Canceled} }}, t.Context()))
++	require.Zero(t, p.loader.cooldownRemaining())
++	require.Nil(t, p.apiPlaybackError())
++}
++
++func TestRetriedDJContextKeepsCursorIdentityUntilSuccessfulLoad(t *testing.T) {
++	p := recoveryPlayer(t)
++	p.sess = &session.Session{}
++	p.app.stateStore = &djMemoryStore{}
++	ctx := &connectpb.Context{Uri: djContextURI, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: trackUri(1)}}}}}
++	p.loadContext(ctx, nil, false, true, func(error) {})
++	dj := &djPlayback{username: "test-account", rootFingerprint: "same-root"}
++	p.djPlayback = dj
++	p.applyLoaderResult(loaderResult{class: classPrefetch, gen: p.prefetchGen, err: &audio.KeyProviderError{Code: 2}})
++	require.Nil(t, p.app.djCursor("test-account"))
++	expireAudioCooldown(p.loader)
++	require.NoError(t, p.play())
++	require.Same(t, dj, p.djPlayback)
++	runQueuedJob(t, p) // Resolves the retained DJ context, without requesting audio.
++	require.Nil(t, p.app.djCursor("test-account"))
++	require.Same(t, dj, p.djPlayback)
++	p.rememberDJPage(&tracks.Snapshot{Current: p.state.player.Track, HasPageContinuation: true, PageNextURL: djPageURL(1)})
++	p.commitLoad(&player.Stream{RequestedId: librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, gid(1)), Media: librespot.NewMediaFromTrack(metaTrack(gid(1), "Recovered DJ"))}, trackUri(1), false, 0, false)
++	require.Equal(t, "same-root", p.app.djCursor("test-account").RootFingerprint)
++	require.Equal(t, djPageURL(1), p.app.djCursor("test-account").NextPageURL)
++	require.Nil(t, p.apiPlaybackError())
++	require.NoError(t, p.app.Close())
++}
+diff --git a/daemon/playback_recovery_transfer_test.go b/daemon/playback_recovery_transfer_test.go
+new file mode 100644
+index 0000000..32eb4f9
+--- /dev/null
++++ b/daemon/playback_recovery_transfer_test.go
+@@ -0,0 +1,145 @@
++//go:build test_unit
++
++package daemon
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/audio"
++	"github.com/devgianlu/go-librespot/dealer"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++	"github.com/stretchr/testify/require"
++)
++
++// A prefetch can be refused after Connect has claimed its new context but
++// before the queued transfer resolves. The cooldown must not leave the new
++// context paired with the old context's track list or lose the transfer data.
++func refusePrefetchAfterTransferClaim(t *testing.T, p *AppPlayer, req dealer.RequestPayload) {
++	t.Helper()
++	playingTrack(t, p, jamTrackUri, "old")
++	oldContext := &connectpb.Context{
++		Uri: p.state.player.ContextUri,
++		Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{
++			{Uri: jamTrackUri, Uid: "old"},
++		}}},
++	}
++	var err error
++	p.state.tracks, err = tracks.NewTrackListFromContext(t.Context(), &librespot.NullLogger{}, nil, oldContext)
++	require.NoError(t, err)
++	require.True(t, p.state.tracks.GoStart(t.Context()))
++	prefetchGen := p.prefetchGen
++
++	require.NoError(t, p.handlePlayerCommand(req))
++	require.True(t, p.state.player.IsBuffering)
++	require.Len(t, p.loader.queue, 1)
++
++	res := p.loader.execute(loaderJob{
++		name:  "prefetch refused while transfer is queued",
++		class: classPrefetch,
++		gen:   prefetchGen,
++		run: func(context.Context) loaderResult {
++			return loaderResult{err: &audio.KeyProviderError{Code: 2}}
++		},
++	}, t.Context())
++	require.Empty(t, p.loader.queue, "the pending transfer cannot run during cooldown")
++	p.applyLoaderResult(res)
++	require.NotNil(t, p.playbackFailure)
++	require.False(t, p.state.player.IsBuffering)
++	require.False(t, p.state.player.IsPlaying)
++	require.Nil(t, p.state.tracks, "the previous context's list must not survive the new claim")
++	require.ErrorIs(t, p.play(), errPlaybackCooldown)
++	require.Empty(t, p.loader.queue)
++
++	p.loader.mu.Lock()
++	p.loader.audioKeyRetryAt = time.Now().Add(-time.Second)
++	p.loader.mu.Unlock()
++	require.NoError(t, p.play())
++	require.Len(t, p.loader.queue, 1, "an explicit retry resolves the retained transfer first")
++	runQueuedJob(t, p)
++}
++
++func TestRecoveryRetryPreservesTransferredPlayingQueue(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.resolveTrackList = resolveWith(0)
++	req := playingQueueTransfer(t, "do_not_retain", "u1")
++
++	refusePrefetchAfterTransferClaim(t, p, req)
++
++	require.Equal(t, queuedUri, p.state.player.Track.GetUri())
++	require.Equal(t, queuedUri, p.state.tracks.CurrentTrack().GetUri())
++	require.Equal(t, "queue", p.state.tracks.CurrentTrack().GetProvider())
++	require.Equal(t, []string{"spotify:track:2infXICqVSUM3bbGSOgFOY", "spotify:track:11hcBLPtbMp4aQI6zGQLub"},
++		trackUris(p.state.player.NextTracks))
++	require.Len(t, p.loader.queue, 1)
++	require.Equal(t, "load "+queuedUri, p.loader.queue[0].name)
++	require.NotNil(t, p.playbackFailure, "only a successful media load confirms recovery")
++}
++
++func TestRecoveryRetryResolvesTransferWithoutCurrentTrack(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.resolveTrackList = resolveWith(0)
++	const nextUri = "spotify:track:3CRDbSIZ4r5MsZ0YwxuEkn"
++	req := transferCommand(t, &connectpb.TransferState{
++		Options: &connectpb.ContextPlayerOptions{},
++		CurrentSession: &connectpb.Session{Context: &connectpb.Context{
++			Uri: "spotify:playlist:37i9dQZF1DX8vwRmUsEIMT",
++			Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{
++				{Uri: nextUri, Uid: "u0"},
++			}}},
++		}},
++		Playback: &connectpb.Playback{Timestamp: time.Now().UnixMilli()},
++	})
++
++	refusePrefetchAfterTransferClaim(t, p, req)
++
++	require.Equal(t, nextUri, p.state.player.Track.GetUri())
++	require.Equal(t, nextUri, p.state.tracks.CurrentTrack().GetUri())
++	require.Len(t, p.loader.queue, 1)
++	require.Equal(t, "load "+nextUri, p.loader.queue[0].name)
++}
++
++func TestRecoveryRetryResolverFailurePreservesAnotherManualRetry(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.resolveTrackList = failResolve
++	req := playingQueueTransfer(t, "do_not_retain", "u1")
++
++	// The first explicit recovery attempt fails to resolve the retained
++	// transfer, before any new media request is made.
++	refusePrefetchAfterTransferClaim(t, p, req)
++
++	require.False(t, p.state.player.IsPlaying)
++	require.False(t, p.state.player.IsBuffering, "a failed resolver must not leave recovery stuck retrying")
++	require.True(t, p.state.player.IsPaused)
++	require.Equal(t, "spotify:playlist:37i9dQZF1DX8vwRmUsEIMT", p.state.player.ContextUri)
++	require.Equal(t, queuedUri, p.state.player.Track.GetUri())
++	require.NotNil(t, p.retryContext, "the failed resolver must retain the original transfer")
++	require.NotNil(t, p.playbackFailure)
++	require.Equal(t, playbackErrorKindAudioKeyRefused, p.playbackFailure.Kind)
++	require.Zero(t, p.apiPlaybackError().RetryAfterMs, "an ordinary resolver failure does not renew the key cooldown")
++	require.Nil(t, p.state.tracks)
++	require.Empty(t, p.loader.queue)
++
++	// Until that context is resolved, relative controls cannot fall through
++	// to autoplay or navigate the previous context's list.
++	gen := p.loadGen
++	require.ErrorIs(t, p.skipNext(nil), ErrNoContext)
++	require.ErrorIs(t, p.skipPrev(true), ErrNoContext)
++	require.Equal(t, gen, p.loadGen)
++	require.Empty(t, p.loader.queue)
++	require.Equal(t, queuedUri, p.state.player.Track.GetUri())
++
++	p.resolveTrackList = resolveWith(0)
++	require.NoError(t, p.play(), "another Space must be able to retry")
++	require.True(t, p.state.player.IsBuffering)
++	runQueuedJob(t, p)
++	require.Equal(t, queuedUri, p.state.tracks.CurrentTrack().GetUri())
++	require.Equal(t, "queue", p.state.tracks.CurrentTrack().GetProvider())
++	require.Equal(t, []string{"spotify:track:2infXICqVSUM3bbGSOgFOY", "spotify:track:11hcBLPtbMp4aQI6zGQLub"},
++		trackUris(p.state.player.NextTracks))
++	require.Len(t, p.loader.queue, 1)
++	require.Equal(t, "load "+queuedUri, p.loader.queue[0].name)
++}
 diff --git a/daemon/player.go b/daemon/player.go
-index 6d62bc1..cbc2af1 100644
+index 6d62bc1..2c710a5 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -54,7 +54,8 @@ type AppPlayer struct {
+@@ -54,13 +54,23 @@ type AppPlayer struct {
  	initialVolumeOnce sync.Once
  	volumeUpdate      chan float32
  
 -	loader *loaderLane
++	playbackFailure    *ApiPlaybackError
++	prefetchKeyFailure bool
++	recoverySelecting  bool
++	retryContext       func()
++
 +	loader     *loaderLane
 +	djPlayback *djPlayback
++	library    *libraryService
  
  	// resolveTrackList builds the track list for a transferred context. Nil
  	// means the real one, over the session's spclient: tests stand in for the
-@@ -321,6 +322,7 @@ func (p *AppPlayer) trackListFromContext(ctx context.Context, spotCtx *connectpb
+ 	// network here.
+ 	resolveTrackList func(ctx context.Context, spotCtx *connectpb.Context) (*tracks.List, error)
+ 
++	// streamFactory is the optional stream constructor; nil uses the real player.
++	streamFactory func(context.Context, librespot.SpotifyId, int64) (*player.Stream, error)
++
+ 	// loadGen stamps track and context work, prefetchGen what is fetched ahead
+ 	// for the transition after it. They are separate because a queue edit or
+ 	// an option change makes whatever was prefetched wrong without making the
+@@ -148,7 +158,7 @@ type AppPlayer struct {
+ 	sleepAtEndOfTrack bool
+ 
+ 	// consecutiveUnplayableSkips bounds how many unplayable tracks in a row advanceNext will
+-	// skip past (Spotify-refused audio keys / restricted media) before giving up — so a run
++	// skip past (restricted media or unsupported formats) before giving up — so a run
+ 	// of refused tracks (even at the very start of a context) advances to the first playable
+ 	// one instead of freezing, and can never loop forever. Reset to 0 on any successful load.
+ 	consecutiveUnplayableSkips int
+@@ -321,6 +331,7 @@ func (p *AppPlayer) trackListFromContext(ctx context.Context, spotCtx *connectpb
  // hands over: its id, options, origin and context. The tracks and the playback
  // are the caller's.
  func (p *AppPlayer) applyTransferSession(transferState *connectpb.TransferState, sentBy string) {
@@ -988,16 +3635,56 @@ index 6d62bc1..cbc2af1 100644
  	if sessId := transferState.CurrentSession.OriginalSessionId; sessId != nil {
  		p.state.player.SessionId = *sessId
  	} else {
-@@ -649,7 +651,7 @@ func nonEmpty(s string) *string {
+@@ -369,6 +380,13 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
+ }
+ 
+ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
++	switch req.Command.Endpoint {
++	case "transfer", "play", "resume", "skip_prev", "skip_next":
++		if err := p.playbackCooldownError(); err != nil {
++			return err
++		}
++		p.prefetchKeyFailure = false
++	}
+ 	p.state.lastCommand = &req
+ 
+ 	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
+@@ -647,9 +665,16 @@ func nonEmpty(s string) *string {
+ }
+ 
  func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
++	switch req.Type {
++	case ApiRequestTypePlay, ApiRequestTypeResume, ApiRequestTypePlayPause, ApiRequestTypePrev, ApiRequestTypeNext:
++		if err := p.playbackCooldownError(); err != nil {
++			return nil, err
++		}
++		p.prefetchKeyFailure = false
++	}
  	switch req.Type {
  	case ApiRequestTypeRoot:
 -		return &ApiRoot{PlaybackReady: p.playbackReady()}, nil
-+		return &ApiRoot{PlaybackReady: p.playbackReady(), DirectDj: true}, nil
++		return &ApiRoot{PlaybackReady: p.playbackReady(), DirectDj: true, Library: true}, nil
  	case ApiRequestTypeStatus:
  		resp := &ApiStatus{
  			Username:           p.sess.Username(),
-@@ -735,6 +737,12 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -664,6 +689,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 			Stopped:            !p.state.player.IsPlaying,
+ 			Paused:             p.state.player.IsPaused,
+ 			Buffering:          p.state.player.IsBuffering,
++			ApiPlaybackError:   p.apiPlaybackError(),
+ 			PlayOrigin:         nonEmpty(p.state.player.PlayOrigin.FeatureIdentifier),
+ 			PlayOriginDeviceId: nonEmpty(p.state.player.PlayOrigin.DeviceIdentifier),
+ 			ContextUri:         nonEmpty(p.state.player.ContextUri),
+@@ -677,6 +703,8 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 		resp.NextTrack = p.apiNextTrack()
+ 
+ 		return resp, nil
++	case ApiRequestTypeLibraryTracks, ApiRequestTypeLibraryContains, ApiRequestTypeLibrarySave:
++		return p.handleLibraryRequest(req)
+ 	case ApiRequestTypeContextTracks:
+ 		if p.meta == nil {
+ 			return nil, ErrNotFound
+@@ -735,6 +763,12 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  		return nil, nil
  	case ApiRequestTypePlay:
  		data := req.Data.(ApiPlay)
@@ -1010,7 +3697,7 @@ index 6d62bc1..cbc2af1 100644
  
  		var skipTo skipToFunc
  		if len(data.SkipToUri) > 0 {
-@@ -767,7 +775,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -767,7 +801,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  			gen:   p.loadGen,
  			reply: apiReply(req),
  			run: func(ctx context.Context) loaderResult {
@@ -1019,7 +3706,7 @@ index 6d62bc1..cbc2af1 100644
  				if err != nil {
  					return loaderResult{err: fmt.Errorf("failed resolving context: %w", err)}
  				}
-@@ -804,6 +812,9 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -804,6 +838,9 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  							}
  						}
  					})
@@ -1041,6 +3728,607 @@ index 7de1519..34165c7 100644
  	p.state.player.Track = snap.Current
  	p.state.player.Index = snap.Index
  	p.publishUpcoming(snap)
+diff --git a/daemon/track_meta_cache.go b/daemon/track_meta_cache.go
+index f9304d9..9c5cae7 100644
+--- a/daemon/track_meta_cache.go
++++ b/daemon/track_meta_cache.go
+@@ -618,7 +618,9 @@ func (p *AppPlayer) apiNextTrack() *ApiTrack {
+ 	if media == nil {
+ 		return nil
+ 	}
+-	return p.newApiResponseStatusMedia(media, 0)
++	resp := p.newApiResponseStatusMedia(media, 0)
++	resp.RequestedUri = next[0].Uri
++	return resp
+ }
+ 
+ // contextTracksResponse describes a context listing from what the caches hold:
+@@ -635,6 +637,7 @@ func (p *AppPlayer) contextTracksResponse(contextUri string, uris []string, read
+ 		entry := ApiContextTrackItem{Uri: uri}
+ 		if media := p.meta.cache.get(uri); media != nil && p.prodInfo != nil {
+ 			entry.Track = p.newApiResponseStatusMedia(media, 0)
++			entry.Track.RequestedUri = uri
+ 			resp.Cached++
+ 		}
+ 		resp.Tracks = append(resp.Tracks, entry)
+diff --git a/proto/spotify/collection/v2/collection.pb.go b/proto/spotify/collection/v2/collection.pb.go
+new file mode 100644
+index 0000000..1f2aa7b
+--- /dev/null
++++ b/proto/spotify/collection/v2/collection.pb.go
+@@ -0,0 +1,371 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.36.11
++// 	protoc        v7.36.1
++// source: spotify/collection/v2/collection.proto
++
++package collectionpb
++
++import (
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	reflect "reflect"
++	sync "sync"
++	unsafe "unsafe"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// Minimal collection-v2 wire schema, corroborated against collection2v2.proto
++// embedded in the Spotify desktop client. Unknown item data remains opaque.
++type PageRequest struct {
++	state           protoimpl.MessageState `protogen:"open.v1"`
++	Username        string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
++	Set             string                 `protobuf:"bytes,2,opt,name=set,proto3" json:"set,omitempty"`
++	PaginationToken string                 `protobuf:"bytes,3,opt,name=pagination_token,json=paginationToken,proto3" json:"pagination_token,omitempty"`
++	Limit           int32                  `protobuf:"varint,4,opt,name=limit,proto3" json:"limit,omitempty"`
++	unknownFields   protoimpl.UnknownFields
++	sizeCache       protoimpl.SizeCache
++}
++
++func (x *PageRequest) Reset() {
++	*x = PageRequest{}
++	mi := &file_spotify_collection_v2_collection_proto_msgTypes[0]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *PageRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*PageRequest) ProtoMessage() {}
++
++func (x *PageRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_spotify_collection_v2_collection_proto_msgTypes[0]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use PageRequest.ProtoReflect.Descriptor instead.
++func (*PageRequest) Descriptor() ([]byte, []int) {
++	return file_spotify_collection_v2_collection_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *PageRequest) GetUsername() string {
++	if x != nil {
++		return x.Username
++	}
++	return ""
++}
++
++func (x *PageRequest) GetSet() string {
++	if x != nil {
++		return x.Set
++	}
++	return ""
++}
++
++func (x *PageRequest) GetPaginationToken() string {
++	if x != nil {
++		return x.PaginationToken
++	}
++	return ""
++}
++
++func (x *PageRequest) GetLimit() int32 {
++	if x != nil {
++		return x.Limit
++	}
++	return 0
++}
++
++type CollectionItem struct {
++	state         protoimpl.MessageState `protogen:"open.v1"`
++	Uri           string                 `protobuf:"bytes,1,opt,name=uri,proto3" json:"uri,omitempty"`
++	AddedAt       int64                  `protobuf:"varint,2,opt,name=added_at,json=addedAt,proto3" json:"added_at,omitempty"`
++	IsRemoved     bool                   `protobuf:"varint,3,opt,name=is_removed,json=isRemoved,proto3" json:"is_removed,omitempty"`
++	ContextUri    *string                `protobuf:"bytes,4,opt,name=context_uri,json=contextUri,proto3,oneof" json:"context_uri,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
++}
++
++func (x *CollectionItem) Reset() {
++	*x = CollectionItem{}
++	mi := &file_spotify_collection_v2_collection_proto_msgTypes[1]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *CollectionItem) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*CollectionItem) ProtoMessage() {}
++
++func (x *CollectionItem) ProtoReflect() protoreflect.Message {
++	mi := &file_spotify_collection_v2_collection_proto_msgTypes[1]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use CollectionItem.ProtoReflect.Descriptor instead.
++func (*CollectionItem) Descriptor() ([]byte, []int) {
++	return file_spotify_collection_v2_collection_proto_rawDescGZIP(), []int{1}
++}
++
++func (x *CollectionItem) GetUri() string {
++	if x != nil {
++		return x.Uri
++	}
++	return ""
++}
++
++func (x *CollectionItem) GetAddedAt() int64 {
++	if x != nil {
++		return x.AddedAt
++	}
++	return 0
++}
++
++func (x *CollectionItem) GetIsRemoved() bool {
++	if x != nil {
++		return x.IsRemoved
++	}
++	return false
++}
++
++func (x *CollectionItem) GetContextUri() string {
++	if x != nil && x.ContextUri != nil {
++		return *x.ContextUri
++	}
++	return ""
++}
++
++type PageResponse struct {
++	state         protoimpl.MessageState `protogen:"open.v1"`
++	Items         []*CollectionItem      `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
++	NextPageToken string                 `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
++	SyncToken     string                 `protobuf:"bytes,3,opt,name=sync_token,json=syncToken,proto3" json:"sync_token,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
++}
++
++func (x *PageResponse) Reset() {
++	*x = PageResponse{}
++	mi := &file_spotify_collection_v2_collection_proto_msgTypes[2]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *PageResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*PageResponse) ProtoMessage() {}
++
++func (x *PageResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_spotify_collection_v2_collection_proto_msgTypes[2]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use PageResponse.ProtoReflect.Descriptor instead.
++func (*PageResponse) Descriptor() ([]byte, []int) {
++	return file_spotify_collection_v2_collection_proto_rawDescGZIP(), []int{2}
++}
++
++func (x *PageResponse) GetItems() []*CollectionItem {
++	if x != nil {
++		return x.Items
++	}
++	return nil
++}
++
++func (x *PageResponse) GetNextPageToken() string {
++	if x != nil {
++		return x.NextPageToken
++	}
++	return ""
++}
++
++func (x *PageResponse) GetSyncToken() string {
++	if x != nil {
++		return x.SyncToken
++	}
++	return ""
++}
++
++type WriteRequest struct {
++	state          protoimpl.MessageState `protogen:"open.v1"`
++	Username       string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
++	Set            string                 `protobuf:"bytes,2,opt,name=set,proto3" json:"set,omitempty"`
++	Items          []*CollectionItem      `protobuf:"bytes,3,rep,name=items,proto3" json:"items,omitempty"`
++	ClientUpdateId string                 `protobuf:"bytes,4,opt,name=client_update_id,json=clientUpdateId,proto3" json:"client_update_id,omitempty"`
++	unknownFields  protoimpl.UnknownFields
++	sizeCache      protoimpl.SizeCache
++}
++
++func (x *WriteRequest) Reset() {
++	*x = WriteRequest{}
++	mi := &file_spotify_collection_v2_collection_proto_msgTypes[3]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *WriteRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*WriteRequest) ProtoMessage() {}
++
++func (x *WriteRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_spotify_collection_v2_collection_proto_msgTypes[3]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use WriteRequest.ProtoReflect.Descriptor instead.
++func (*WriteRequest) Descriptor() ([]byte, []int) {
++	return file_spotify_collection_v2_collection_proto_rawDescGZIP(), []int{3}
++}
++
++func (x *WriteRequest) GetUsername() string {
++	if x != nil {
++		return x.Username
++	}
++	return ""
++}
++
++func (x *WriteRequest) GetSet() string {
++	if x != nil {
++		return x.Set
++	}
++	return ""
++}
++
++func (x *WriteRequest) GetItems() []*CollectionItem {
++	if x != nil {
++		return x.Items
++	}
++	return nil
++}
++
++func (x *WriteRequest) GetClientUpdateId() string {
++	if x != nil {
++		return x.ClientUpdateId
++	}
++	return ""
++}
++
++var File_spotify_collection_v2_collection_proto protoreflect.FileDescriptor
++
++const file_spotify_collection_v2_collection_proto_rawDesc = "" +
++	"\n" +
++	"&spotify/collection/v2/collection.proto\x12\x1bspotify.collection.proto.v2\"|\n" +
++	"\vPageRequest\x12\x1a\n" +
++	"\busername\x18\x01 \x01(\tR\busername\x12\x10\n" +
++	"\x03set\x18\x02 \x01(\tR\x03set\x12)\n" +
++	"\x10pagination_token\x18\x03 \x01(\tR\x0fpaginationToken\x12\x14\n" +
++	"\x05limit\x18\x04 \x01(\x05R\x05limit\"\x92\x01\n" +
++	"\x0eCollectionItem\x12\x10\n" +
++	"\x03uri\x18\x01 \x01(\tR\x03uri\x12\x19\n" +
++	"\badded_at\x18\x02 \x01(\x03R\aaddedAt\x12\x1d\n" +
++	"\n" +
++	"is_removed\x18\x03 \x01(\bR\tisRemoved\x12$\n" +
++	"\vcontext_uri\x18\x04 \x01(\tH\x00R\n" +
++	"contextUri\x88\x01\x01B\x0e\n" +
++	"\f_context_uri\"\x98\x01\n" +
++	"\fPageResponse\x12A\n" +
++	"\x05items\x18\x01 \x03(\v2+.spotify.collection.proto.v2.CollectionItemR\x05items\x12&\n" +
++	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\x12\x1d\n" +
++	"\n" +
++	"sync_token\x18\x03 \x01(\tR\tsyncToken\"\xa9\x01\n" +
++	"\fWriteRequest\x12\x1a\n" +
++	"\busername\x18\x01 \x01(\tR\busername\x12\x10\n" +
++	"\x03set\x18\x02 \x01(\tR\x03set\x12A\n" +
++	"\x05items\x18\x03 \x03(\v2+.spotify.collection.proto.v2.CollectionItemR\x05items\x12(\n" +
++	"\x10client_update_id\x18\x04 \x01(\tR\x0eclientUpdateIdBLZJgithub.com/devgianlu/go-librespot/proto/spotify/collection/v2;collectionpbb\x06proto3"
++
++var (
++	file_spotify_collection_v2_collection_proto_rawDescOnce sync.Once
++	file_spotify_collection_v2_collection_proto_rawDescData []byte
++)
++
++func file_spotify_collection_v2_collection_proto_rawDescGZIP() []byte {
++	file_spotify_collection_v2_collection_proto_rawDescOnce.Do(func() {
++		file_spotify_collection_v2_collection_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_spotify_collection_v2_collection_proto_rawDesc), len(file_spotify_collection_v2_collection_proto_rawDesc)))
++	})
++	return file_spotify_collection_v2_collection_proto_rawDescData
++}
++
++var file_spotify_collection_v2_collection_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
++var file_spotify_collection_v2_collection_proto_goTypes = []any{
++	(*PageRequest)(nil),    // 0: spotify.collection.proto.v2.PageRequest
++	(*CollectionItem)(nil), // 1: spotify.collection.proto.v2.CollectionItem
++	(*PageResponse)(nil),   // 2: spotify.collection.proto.v2.PageResponse
++	(*WriteRequest)(nil),   // 3: spotify.collection.proto.v2.WriteRequest
++}
++var file_spotify_collection_v2_collection_proto_depIdxs = []int32{
++	1, // 0: spotify.collection.proto.v2.PageResponse.items:type_name -> spotify.collection.proto.v2.CollectionItem
++	1, // 1: spotify.collection.proto.v2.WriteRequest.items:type_name -> spotify.collection.proto.v2.CollectionItem
++	2, // [2:2] is the sub-list for method output_type
++	2, // [2:2] is the sub-list for method input_type
++	2, // [2:2] is the sub-list for extension type_name
++	2, // [2:2] is the sub-list for extension extendee
++	0, // [0:2] is the sub-list for field type_name
++}
++
++func init() { file_spotify_collection_v2_collection_proto_init() }
++func file_spotify_collection_v2_collection_proto_init() {
++	if File_spotify_collection_v2_collection_proto != nil {
++		return
++	}
++	file_spotify_collection_v2_collection_proto_msgTypes[1].OneofWrappers = []any{}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: unsafe.Slice(unsafe.StringData(file_spotify_collection_v2_collection_proto_rawDesc), len(file_spotify_collection_v2_collection_proto_rawDesc)),
++			NumEnums:      0,
++			NumMessages:   4,
++			NumExtensions: 0,
++			NumServices:   0,
++		},
++		GoTypes:           file_spotify_collection_v2_collection_proto_goTypes,
++		DependencyIndexes: file_spotify_collection_v2_collection_proto_depIdxs,
++		MessageInfos:      file_spotify_collection_v2_collection_proto_msgTypes,
++	}.Build()
++	File_spotify_collection_v2_collection_proto = out.File
++	file_spotify_collection_v2_collection_proto_goTypes = nil
++	file_spotify_collection_v2_collection_proto_depIdxs = nil
++}
+diff --git a/proto/spotify/collection/v2/collection.proto b/proto/spotify/collection/v2/collection.proto
+new file mode 100644
+index 0000000..4643d5f
+--- /dev/null
++++ b/proto/spotify/collection/v2/collection.proto
+@@ -0,0 +1,29 @@
++syntax = "proto3";
++package spotify.collection.proto.v2;
++option go_package = "github.com/devgianlu/go-librespot/proto/spotify/collection/v2;collectionpb";
++
++// Minimal collection-v2 wire schema, corroborated against collection2v2.proto
++// embedded in the Spotify desktop client. Unknown item data remains opaque.
++message PageRequest {
++  string username = 1;
++  string set = 2;
++  string pagination_token = 3;
++  int32 limit = 4;
++}
++message CollectionItem {
++  string uri = 1;
++  int64 added_at = 2;
++  bool is_removed = 3;
++  optional string context_uri = 4;
++}
++message PageResponse {
++  repeated CollectionItem items = 1;
++  string next_page_token = 2;
++  string sync_token = 3;
++}
++message WriteRequest {
++  string username = 1;
++  string set = 2;
++  repeated CollectionItem items = 3;
++  string client_update_id = 4;
++}
+diff --git a/spclient/collection.go b/spclient/collection.go
+new file mode 100644
+index 0000000..d5417b8
+--- /dev/null
++++ b/spclient/collection.go
+@@ -0,0 +1,56 @@
++package spclient
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++
++	collectionpb "github.com/devgianlu/go-librespot/proto/spotify/collection/v2"
++	"google.golang.org/protobuf/proto"
++)
++
++const collectionContentType = "application/vnd.collection-v2.spotify.proto"
++const maxCollectionResponse = 4 << 20
++
++func (c *Spclient) collectionRequest(ctx context.Context, path string, request proto.Message) ([]byte, error) {
++	body, err := proto.Marshal(request)
++	if err != nil {
++		return nil, fmt.Errorf("encoding collection request: %w", err)
++	}
++	resp, err := c.Request(ctx, http.MethodPost, path, nil, http.Header{
++		"Content-Type": {collectionContentType}, "Accept": {collectionContentType},
++	}, body)
++	if err != nil {
++		return nil, err
++	}
++	defer func() { _ = resp.Body.Close() }()
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 || path == "/collection/v2/paging" && resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("Spotify collection request failed (HTTP %d)", resp.StatusCode)
++	}
++	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxCollectionResponse+1))
++	if err != nil {
++		return nil, fmt.Errorf("reading collection response: %w", err)
++	}
++	if len(raw) > maxCollectionResponse {
++		return nil, fmt.Errorf("Spotify collection response exceeded the size limit")
++	}
++	return raw, nil
++}
++
++func (c *Spclient) CollectionPage(ctx context.Context, request *collectionpb.PageRequest) (*collectionpb.PageResponse, error) {
++	raw, err := c.collectionRequest(ctx, "/collection/v2/paging", request)
++	if err != nil {
++		return nil, err
++	}
++	var result collectionpb.PageResponse
++	if err := proto.Unmarshal(raw, &result); err != nil {
++		return nil, fmt.Errorf("decoding collection response: %w", err)
++	}
++	return &result, nil
++}
++
++func (c *Spclient) CollectionWrite(ctx context.Context, request *collectionpb.WriteRequest) error {
++	_, err := c.collectionRequest(ctx, "/collection/v2/write", request)
++	return err
++}
+diff --git a/spclient/collection_test.go b/spclient/collection_test.go
+new file mode 100644
+index 0000000..c7f861b
+--- /dev/null
++++ b/spclient/collection_test.go
+@@ -0,0 +1,98 @@
++package spclient
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net/http"
++	"net/url"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	collectionpb "github.com/devgianlu/go-librespot/proto/spotify/collection/v2"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/proto"
++)
++
++type collectionRoundTrip func(*http.Request) (*http.Response, error)
++
++func (f collectionRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
++func collectionTestClient(t *testing.T, fn collectionRoundTrip) *Spclient {
++	t.Helper()
++	base, err := url.Parse("https://collection.test/")
++	require.NoError(t, err)
++	return &Spclient{log: &librespot.NullLogger{}, baseUrl: base, client: &http.Client{Transport: fn}, accessToken: func(context.Context, bool) (string, error) { return "test-token", nil }}
++}
++func collectionTestResponse(status int, body []byte) *http.Response {
++	return &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewReader(body)), Header: http.Header{}}
++}
++
++func TestCollectionPagePreservesVendorHeadersAndTypedPayload(t *testing.T) {
++	request := &collectionpb.PageRequest{Username: "test-account", Set: "collection", PaginationToken: "next-page", Limit: 3}
++	want := &collectionpb.PageResponse{Items: []*collectionpb.CollectionItem{{Uri: "spotify:track:0000000000000000000001", AddedAt: 1 << 35}}, NextPageToken: "later"}
++	c := collectionTestClient(t, func(r *http.Request) (*http.Response, error) {
++		require.Equal(t, "POST", r.Method)
++		require.Equal(t, "/collection/v2/paging", r.URL.Path)
++		require.Equal(t, collectionContentType, r.Header.Get("Content-Type"))
++		require.Equal(t, collectionContentType, r.Header.Get("Accept"))
++		require.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
++		raw, err := io.ReadAll(r.Body)
++		require.NoError(t, err)
++		var got collectionpb.PageRequest
++		require.NoError(t, proto.Unmarshal(raw, &got))
++		require.True(t, proto.Equal(request, &got))
++		raw, err = proto.Marshal(want)
++		require.NoError(t, err)
++		return collectionTestResponse(200, raw), nil
++	})
++	got, err := c.CollectionPage(t.Context(), request)
++	require.NoError(t, err)
++	require.True(t, proto.Equal(want, got))
++}
++func TestCollectionPageAllowsEmptyProtoAndRejectsInvalidResponses(t *testing.T) {
++	for _, tc := range []struct {
++		name      string
++		status    int
++		raw       []byte
++		wantError bool
++	}{
++		{"empty library", 200, nil, false}, {"no content is not a page", 204, nil, true}, {"forbidden", 403, nil, true},
++		{"invalid protobuf", 200, []byte{0xff}, true}, {"oversized", 200, make([]byte, maxCollectionResponse+1), true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c := collectionTestClient(t, func(*http.Request) (*http.Response, error) { return collectionTestResponse(tc.status, tc.raw), nil })
++			got, err := c.CollectionPage(t.Context(), &collectionpb.PageRequest{Username: "account", Set: "collection", Limit: 300})
++			if tc.wantError {
++				require.Error(t, err)
++				require.Nil(t, got)
++			} else {
++				require.NoError(t, err)
++				require.Empty(t, got.Items)
++				require.Empty(t, got.NextPageToken)
++			}
++		})
++	}
++}
++func TestCollectionWriteConfirmsOnlySuccessfulResponse(t *testing.T) {
++	for _, status := range []int{200, 204, 403, 429} {
++		t.Run(http.StatusText(status), func(t *testing.T) {
++			want := &collectionpb.WriteRequest{Username: "test-account", Set: "collection", ClientUpdateId: "d370f4f9-ea85-45a0-874f-754ac2b3c4a5", Items: []*collectionpb.CollectionItem{{Uri: "spotify:track:0000000000000000000001", IsRemoved: true}}}
++			c := collectionTestClient(t, func(r *http.Request) (*http.Response, error) {
++				require.Equal(t, "/collection/v2/write", r.URL.Path)
++				require.Equal(t, collectionContentType, r.Header.Get("Content-Type"))
++				raw, err := io.ReadAll(r.Body)
++				require.NoError(t, err)
++				var got collectionpb.WriteRequest
++				require.NoError(t, proto.Unmarshal(raw, &got))
++				require.True(t, proto.Equal(want, &got))
++				return collectionTestResponse(status, nil), nil
++			})
++			err := c.CollectionWrite(t.Context(), want)
++			if status < 300 {
++				require.NoError(t, err)
++			} else {
++				require.Error(t, err)
++			}
++		})
++	}
++}
 diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
 index 9a2220b..b20bece 100644
 --- a/spclient/context_resolver.go
@@ -1062,10 +4350,21 @@ index 9a2220b..b20bece 100644
  	for idx >= len(r.ctx.Pages) {
  		lastPage := r.ctx.Pages[len(r.ctx.Pages)-1]
 diff --git a/spclient/spclient.go b/spclient/spclient.go
-index db03595..99b681d 100644
+index db03595..bd516f8 100644
 --- a/spclient/spclient.go
 +++ b/spclient/spclient.go
-@@ -556,6 +556,23 @@ func (c *Spclient) ContextResolveUrl(ctx context.Context, hmUrl string) (*connec
+@@ -101,7 +101,9 @@ func (c *Spclient) innerRequestWith(ctx context.Context, client *http.Client, me
+ 	}
+ 
+ 	if body != nil {
+-		req.Header.Set("Content-Type", "application/x-protobuf")
++		if req.Header.Get("Content-Type") == "" {
++			req.Header.Set("Content-Type", "application/x-protobuf")
++		}
+ 
+ 		req.GetBody = func() (io.ReadCloser, error) {
+ 			return io.NopCloser(bytes.NewReader(body)), nil
+@@ -556,6 +558,23 @@ func (c *Spclient) ContextResolveUrl(ctx context.Context, hmUrl string) (*connec
  	return &context, nil
  }
  

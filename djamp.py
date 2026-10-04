@@ -24,6 +24,8 @@ import time
 import unicodedata
 from urllib.parse import urlsplit
 
+from djamp_library import LibraryWorker
+
 ROOT = Path.home()
 CONFIG = ROOT / ".config/go-librespot"
 LOG = ROOT / ".local/state/djamp/player.log"
@@ -57,6 +59,11 @@ def fit(value, width):
 def clock_text(milliseconds):
     seconds = max(0, int(milliseconds or 0) // 1000)
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def library_track_uri(track):
+    """Keep likes on the original song when Spotify plays a regional substitute."""
+    return track.get("requested_uri") or track.get("uri") or ""
 
 
 def spotify_uri(value):
@@ -157,11 +164,18 @@ class PlayerProcess:
 def playback_position(status, received_at, now=None):
     track = status.get("track") or {}
     position = track.get("position") or 0
-    if not any(status.get(k) for k in ("paused", "stopped", "buffering")):
+    if not any(status.get(k) for k in ("paused", "stopped", "buffering", "playback_error")):
         # Never invent progress during a prolonged connection failure.
         position += min(1500, max(0, ((now or time.monotonic()) - received_at) * 1000))
     duration = track.get("duration") or 0
     return max(0, min(position, duration)) if duration else max(0, position)
+
+
+def playback_retry_seconds(state, now=None):
+    failure = (state.get("status") or {}).get("playback_error") or {}
+    now = time.monotonic() if now is None else now
+    elapsed = max(0, now - state.get("received", now)) * 1000
+    return max(0, math.ceil(((failure.get("retry_after_ms") or 0) - elapsed) / 1000))
 
 
 class PlayerWorker(threading.Thread):
@@ -173,6 +187,7 @@ class PlayerWorker(threading.Thread):
         self.lock = threading.Lock()
         self.autoplay_pending = autoplay
         self.dj_requested = False
+        self.dj_queued = False
         self.dj_started_at = None
         self.previous_track = None
         self.state = {"connected": False, "ready": False, "status": {}, "auth": {},
@@ -184,23 +199,59 @@ class PlayerWorker(threading.Thread):
             return dict(self.state)
 
     def command(self, path, payload=None):
-        try:
-            self.commands.put_nowait((path, payload))
-        except queue.Full:
-            with self.lock:
-                self.state["notice"] = "Waiting for the player to finish previous commands."
+        is_dj = path == "/player/play" and (payload or {}).get("uri") == DJ_URI
+        with self.lock:
+            # Reject cooldown input now: it must never become a delayed retry.
+            if path != "/player/volume" and playback_retry_seconds(self.state):
+                return False
+            if is_dj and (self.dj_queued or self.state["dj_starting"]):
+                return False
+            try:
+                self.commands.put_nowait((path, payload))
+            except queue.Full:
+                self.state["notice"] = "Player busy; command was not queued. Try again."
+                return False
+            if is_dj:
+                self.dj_queued = True
+            return True
+
+    def _discard_playback_commands(self):
+        # A failed request invalidates the playback input accumulated behind it.
+        # Preserve independent volume changes and normal successful Next bursts.
+        with self.lock:
+            volumes = []
+            while True:
+                try:
+                    command = self.commands.get_nowait()
+                except queue.Empty:
+                    break
+                if command[0] == "/player/volume":
+                    volumes.append(command)
+            for command in volumes:
+                self.commands.put_nowait(command)
+            self.dj_queued = False
 
     def _notice(self, message, starting=False):
         with self.lock:
             self.state.update(notice=message, dj_starting=starting)
 
     def _process_command(self, path, payload):
+        is_dj = path == "/player/play" and (payload or {}).get("uri") == DJ_URI
+        with self.lock:
+            if is_dj:
+                self.dj_queued = False
+            if path != "/player/volume" and playback_retry_seconds(self.state):
+                return
+            if is_dj:
+                if self.dj_requested or self.dj_started_at is not None:
+                    return
+                self.state["dj_starting"] = True
         # A playback choice supersedes startup autoplay. Volume adjustments
         # should still work without cancelling a queued or loading DJ session.
         if path != "/player/volume":
             self.autoplay_pending = False
             self.dj_started_at = None
-            self.dj_requested = path == "/player/play" and (payload or {}).get("uri") == DJ_URI
+            self.dj_requested = is_dj
             if self.dj_requested:
                 self._notice("Waiting for Spotify to start DJ X…", starting=True)
                 return
@@ -209,6 +260,8 @@ class PlayerWorker(threading.Thread):
             if not self.dj_requested and self.dj_started_at is None:
                 self._notice("")
         except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
+            if path != "/player/volume":
+                self._discard_playback_commands()
             self._notice(clean(exc), starting=self.dj_requested or self.dj_started_at is not None)
 
     def _start_dj(self, supported):
@@ -221,6 +274,7 @@ class PlayerWorker(threading.Thread):
             self.api.request("/player/play", {"uri": DJ_URI}, post=True)
             self.dj_started_at = time.monotonic()
         except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
+            self._discard_playback_commands()
             self._notice("Could not start DJ X: " + clean(exc) + " · Press d to retry.")
 
     def _poll(self):
@@ -235,7 +289,9 @@ class PlayerWorker(threading.Thread):
         ready = bool(root.get("playback_ready"))
         status = self.api.request("/status") if ready else {}
         track = status.get("track") or {}
+        failure = status.get("playback_error")
         with self.lock:
+            previous_failure = (self.state.get("status") or {}).get("playback_error")
             recent = list(self.state["recent"])
             if track.get("uri") and self.previous_track and track["uri"] != self.previous_track.get("uri"):
                 recent = [self.previous_track] + [t for t in recent if t.get("uri") != self.previous_track.get("uri")]
@@ -245,8 +301,18 @@ class PlayerWorker(threading.Thread):
                               status=status, auth=auth, received=time.monotonic(), error="",
                               recent=recent[:40])
 
+        if failure:
+            # Failed idle playback is not a fresh session to autostart. Repeated
+            # polls keep the backend error visible until a successful load.
+            self.autoplay_pending = False
+            if not previous_failure or failure.get("retry_after_ms", 0) > 0:
+                self.dj_requested = False
+                self.dj_started_at = None
+                self._discard_playback_commands()
+                self._notice("")
+
         if self.dj_started_at is not None:
-            if status.get("context_uri") == DJ_URI and track and not status.get("stopped") and not status.get("buffering"):
+            if not failure and status.get("context_uri") == DJ_URI and track and not status.get("stopped") and not status.get("buffering"):
                 self.dj_started_at = None
                 self._notice("")
             elif time.monotonic() - self.dj_started_at >= 30:
@@ -430,6 +496,49 @@ def palette():
     return result
 
 
+def render_library(canvas, library, selection, y, x, height, width):
+    items = library.get("items") or []
+    offset, total = library.get("offset", 0), library.get("total", 0)
+    end = offset + len(items)
+    title = f"LIKED SONGS · {offset + 1}–{end} / {total}" if items else "LIKED SONGS"
+    if library.get("loading"):
+        title += " · loading"
+    canvas.box(y, x, height, width, title)
+    if not items:
+        message = ("Loading your liked songs…" if library.get("loading") else
+                   library.get("error") or ("No liked songs yet. l likes the playing song."
+                                            if library.get("loaded") else "Open Liked Songs with L."))
+        canvas.put(y + 2, x + 3, message, "muted", width=width - 6)
+        return
+    rows = max(1, height - 2)
+    first = max(0, min(selection - rows + 1, len(items) - rows))
+    for row, index in enumerate(range(first, min(len(items), first + rows))):
+        item = items[index]
+        selected = index == selection
+        artist = " · ".join(item.get("artist_names") or [])
+        name = item.get("name") or "Unknown track"
+        label = ("> " if selected else "  ") + name + (" / " + artist if artist else "")
+        if item.get("playable") is False:
+            label += " (unavailable)"
+        canvas.put(y + 1 + row, x + 2, label, "accent" if selected else "muted",
+                   bold=selected, width=width - 4)
+
+
+def demo_library_state(offset=0, current_uri=None, removed=None):
+    removed = removed or set()
+    tracks = [{"uri": "spotify:track:" + str(index).zfill(22),
+               "name": "Midnight City" if index == 0 else f"Demo favorite {index + 1:02d}",
+               "artist_names": ["M83" if index == 0 else "Preview artist"],
+               "album_name": "Offline preview", "duration": 243000, "playable": True}
+              for index in range(25)]
+    tracks = [track for track in tracks if track["uri"] not in removed]
+    return {"items": tracks[offset:offset + 20], "offset": offset, "limit": 20,
+            "total": len(tracks), "has_next": offset + 20 < len(tracks),
+            "loading": False, "loaded": True, "error": "", "notice": "",
+            "current_uri": current_uri, "liked": current_uri not in removed,
+            "like_pending": False, "pending_uri": None}
+
+
 def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False):
     screen_h, screen_w = canvas.window.getmaxyx()
     canvas.window.erase()
@@ -442,10 +551,18 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
     top, left = (screen_h - height) // 2, (screen_w - width) // 2
     status = state.get("status") or {}
     track = status.get("track") or {}
+    library = state.get("library") or {}
+    library_open = state.get("library_open", False)
     paused, stopped = status.get("paused", False), status.get("stopped", True)
     connected = state.get("connected", False)
     ready = state.get("ready", False)
-    playing = connected and ready and not paused and not stopped and bool(track)
+    failure = status.get("playback_error") or {}
+    retry_seconds = playback_retry_seconds(state)
+    retrying = connected and failure and not retry_seconds and status.get("buffering")
+    recovery = ("Retrying selected track…" if retrying else
+                f"Retry in {retry_seconds}s · playback controls paused" if retry_seconds else
+                "Press Space to retry this track.") if failure and connected else ""
+    playing = connected and ready and not paused and not stopped and not failure and bool(track)
     context = status.get("context_name") or "Spotify Connect"
     label = "PLAYING" if playing else "PAUSED" if paused else "READY" if ready else "CONNECTING"
     if status.get("buffering"):
@@ -454,16 +571,30 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
         label = "CONNECTING"
     elif state.get("dj_starting"):
         label = "STARTING DJ"
+    if failure and connected:
+        label = "RETRYING" if retrying else "FAILED"
 
     canvas.put(top, left + 1, "D J A M P", "accent", True)
     canvas.put(top, left + 16, "SPOTIFY  /  TERMINAL PLAYER" if width >= 84 else "SPOTIFY", "muted")
     canvas.put(top, left + width - 15, "● " + label, "accent" if playing else "warm")
     canvas.put(top + 1, left + 1, "DEMO · NO SPOTIFY CONNECTION" if demo else "Your music. Your DJ. Your terminal.", "muted")
-    canvas.box(top + 3, left, 8, width, "NOW PLAYING")
-    canvas.put(top + 3, left + width - 21, " OMARCHY DJ ", "muted")
+    canvas.box(top + 3, left, 8, width, "RETRYING PLAYBACK" if retrying else
+               "PLAYBACK STOPPED" if failure else "NOW PLAYING")
+    badge = " OMARCHY DJ "
+    current_uri = library_track_uri(track)
+    if (re.fullmatch(r"spotify:track:[A-Za-z0-9]{22}", library.get("current_uri") or "")
+            and library.get("current_uri") == current_uri):
+        badge = (" [..] SAVING " if library.get("like_pending") and library.get("pending_uri") == current_uri else
+                 " [♥] LIKED " if library.get("liked") is True else
+                 " [ ] l LIKE " if library.get("liked") is False else " l LIKE ")
+    canvas.put(top + 3, left + width - 21, badge, "accent" if library.get("liked") else "muted")
     auth = state.get("auth") or {}
     if auth.get("code"):
         title, artist, album = "Connect your Spotify account", "Open spotify.com/pair", "Your code: " + str(auth["code"])
+    elif failure:
+        title = track.get("name") or "Playback stopped"
+        artist = clean(failure.get("message")) or "Spotify could not load this track."
+        album = recovery or "Waiting for the player to reconnect…"
     elif track:
         title = track.get("name") or "DJ narration"
         artist = " · ".join(track.get("artist_names") or []) or "Spotify DJ"
@@ -494,69 +625,78 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
     volume_bar = "▰" * round(volume / 10) + "▱" * (10 - round(volume / 10))
     canvas.put(top + 11, left + width - 21, f"{volume_bar} {volume:3d}%", "accent")
 
-    visual_h = min(10, max(5, height - 25))
-    visual_y = top + 13
-    bands, wave, audio_message = audio
-    canvas.box(visual_y, left, visual_h, width, ("SPECTRUM", "WAVEFORM", "VISUALIZER OFF")[mode])
-    if width > 70:
-        canvas.put(visual_y, left + width - 21, " OUTPUT AUDIO ", "muted")
-    graph_h, graph_w = visual_h - 2, width - 6
-    if mode == 0:
-        count = min(32, graph_w // 2)
-        spacing = graph_w / count
-        blocks = " ▁▂▃▄▅▆▇█"
-        for i in range(count):
-            value = bands[min(len(bands) - 1, i * len(bands) // count)]
-            level = value * graph_h * 8
-            for row in range(graph_h):
-                amount = int(min(8, max(0, level - (graph_h - row - 1) * 8)))
-                if amount:
-                    canvas.put(visual_y + 1 + row, left + 3 + int(i * spacing), blocks[amount] * 2,
-                               "warm" if row < graph_h / 4 else "accent" if row < graph_h * 0.65 else "cyan")
-    elif mode == 1:
-        middle = visual_y + 1 + graph_h // 2
-        canvas.put(middle, left + 3, "·" * graph_w, "border")
-        for i in range(graph_w):
-            value = wave[min(len(wave) - 1, int(i * len(wave) / graph_w))]
-            row = min(graph_h - 1, max(0, graph_h // 2 - round(value * (graph_h - 1))))
-            canvas.put(visual_y + 1 + row, left + 3 + i, "•", "cyan")
-    if mode == 2 or audio_message != "OUTPUT AUDIO":
-        hint = "Press v to show the visualizer" if mode == 2 else audio_message
-        canvas.put(visual_y + 1, left + 3, hint, "muted", width=width - 6)
-
-    list_y = visual_y + visual_h + 1
-    list_h = top + height - 4 - list_y
-    next_track = status.get("next_track") or {}
-    if list_h >= 5:
-        canvas.box(list_y, left, list_h, width, "DJ SESSION" if "dj" in context.lower() else "SESSION")
-        next_name = next_track.get("name") or ("The DJ will reveal what comes next" if "dj" in context.lower() else "Waiting for the next track")
-        canvas.put(list_y + 1, left + 3, "NEXT", "accent")
-        canvas.put(list_y + 1, left + 10, next_name, "text", width=width - 13)
-        for index, item in enumerate(state.get("recent", [])[:list_h - 3]):
-            canvas.put(list_y + 2 + index, left + 3, f"{index + 1:02d}", "muted")
-            name = item.get("name") or "DJ narration"
-            names = " · ".join(item.get("artist_names") or [])
-            canvas.put(list_y + 2 + index, left + 10, name + ("  /  " + names if names else ""), "muted", width=width - 13)
-        if not state.get("recent") and list_h > 4:
-            canvas.put(list_y + 3, left + 3, "Recently played tracks appear here as your session continues.", "muted", width=width - 6)
+    if library_open:
+        render_library(canvas, library, state.get("library_selection", 0),
+                       top + 13, left, height - 16, width)
     else:
-        canvas.put(list_y, left + 2, "NEXT  " + (next_track.get("name") or "Selected by your DJ"), "muted", width=width - 4)
+        visual_h = min(10, max(5, height - 25))
+        visual_y = top + 13
+        bands, wave, audio_message = audio
+        canvas.box(visual_y, left, visual_h, width, ("SPECTRUM", "WAVEFORM", "VISUALIZER OFF")[mode])
+        if width > 70:
+            canvas.put(visual_y, left + width - 21, " OUTPUT AUDIO ", "muted")
+        graph_h, graph_w = visual_h - 2, width - 6
+        if mode == 0:
+            count = min(32, graph_w // 2)
+            spacing = graph_w / count
+            blocks = " ▁▂▃▄▅▆▇█"
+            for i in range(count):
+                value = bands[min(len(bands) - 1, i * len(bands) // count)]
+                level = value * graph_h * 8
+                for row in range(graph_h):
+                    amount = int(min(8, max(0, level - (graph_h - row - 1) * 8)))
+                    if amount:
+                        canvas.put(visual_y + 1 + row, left + 3 + int(i * spacing), blocks[amount] * 2,
+                                   "warm" if row < graph_h / 4 else "accent" if row < graph_h * 0.65 else "cyan")
+        elif mode == 1:
+            middle = visual_y + 1 + graph_h // 2
+            canvas.put(middle, left + 3, "·" * graph_w, "border")
+            for i in range(graph_w):
+                value = wave[min(len(wave) - 1, int(i * len(wave) / graph_w))]
+                row = min(graph_h - 1, max(0, graph_h // 2 - round(value * (graph_h - 1))))
+                canvas.put(visual_y + 1 + row, left + 3 + i, "•", "cyan")
+        if mode == 2 or audio_message != "OUTPUT AUDIO":
+            hint = "Press v to show the visualizer" if mode == 2 else audio_message
+            canvas.put(visual_y + 1, left + 3, hint, "muted", width=width - 6)
+
+        list_y = visual_y + visual_h + 1
+        list_h = top + height - 4 - list_y
+        next_track = status.get("next_track") or {}
+        if list_h >= 5:
+            canvas.box(list_y, left, list_h, width, "DJ SESSION" if "dj" in context.lower() else "SESSION")
+            next_name = next_track.get("name") or ("The DJ will reveal what comes next" if "dj" in context.lower() else "Waiting for the next track")
+            canvas.put(list_y + 1, left + 3, "NEXT", "accent")
+            canvas.put(list_y + 1, left + 10, next_name, "text", width=width - 13)
+            for index, item in enumerate(state.get("recent", [])[:list_h - 3]):
+                canvas.put(list_y + 2 + index, left + 3, f"{index + 1:02d}", "muted")
+                name = item.get("name") or "DJ narration"
+                names = " · ".join(item.get("artist_names") or [])
+                canvas.put(list_y + 2 + index, left + 10, name + ("  /  " + names if names else ""), "muted", width=width - 13)
+            if not state.get("recent") and list_h > 4:
+                canvas.put(list_y + 3, left + 3, "Recently played tracks appear here as your session continues.", "muted", width=width - 6)
+        else:
+            canvas.put(list_y, left + 2, "NEXT  " + (next_track.get("name") or "Selected by your DJ"), "muted", width=width - 4)
 
     codec = (track.get("codec") or "").upper()
     bitrate = track.get("bitrate")
     quality = f"{codec} · {bitrate} kbps" if bitrate else codec
-    footer = notice or state.get("error") or state.get("notice") or ("Connecting to the player…" if not connected else f"{context}   {quality}")
-    canvas.put(top + height - 3, left + 2, footer, "warm" if notice or state.get("error") or state.get("notice") else "muted", width=width - 4)
-    keys = "space play/pause · n/p skip · +/- vol · v view · o link · d DJ set · ? help · q quit"
+    footer = recovery or notice or state.get("error") or state.get("notice") or library.get("error") or library.get("notice") or ("Connecting to the player…" if not connected else f"{context}   {quality}")
+    canvas.put(top + height - 3, left + 2, footer, "warm" if recovery or notice or state.get("error") or state.get("notice") or library.get("error") or library.get("notice") else "muted", width=width - 4)
+    keys = "space play · n/p skip · +/- vol · l like · L liked · d DJ · ? help · q quit"
     if width < 82:
-        keys = "space play · n/p skip · d DJ set · ? help · q quit"
+        keys = "space play · l like · L liked · d DJ · ? · q quit"
+    if library_open:
+        keys = "↑↓ choose · enter play · [ ] page · Esc back · ? help"
     canvas.put(top + height - 1, left + 1, keys, "cyan", width=width - 2)
     if show_help:
-        lines = ["KEYBOARD CONTROLS", "", "Space       Play / pause", "n / p       Next / previous track",
-                 "← / →       Seek 10 seconds", "+ / -       Volume up / down", "m           Mute / restore volume",
-                 "v           Spectrum / waveform / off", "o           Play a Spotify link or URI",
-                 "d / D       Start the next DJ set", "b           Open Spotify in browser", "q / Ctrl+C  Quit", "", "DJ starts automatically when idle.",
-                 "The visualizer follows your audio output.", "", "Press ? or Esc to close"]
+        lines = ["KEYBOARD CONTROLS", "", "Space         Play / pause", "n / p         Next / previous track",
+                 "← / →         Seek 10 seconds", "+ / - / m     Volume / mute",
+                 "l             Like/unlike PLAYING song", "L             Open / close liked songs",
+                 "↑↓ / j k      Select a liked song", "PgUp/PgDn [ ] Library pages",
+                 "Enter         Play selected liked song", "r             Refresh library page",
+                 "Esc           Return to player", "d / D         Start the next DJ set",
+                 "v             Visualizer modes", "o / b         Play link / open Spotify",
+                 "q / Ctrl+C    Quit", "", "Press ? or Esc to close"]
         box_w = min(width - 2, 54)
         box_x, box_y = (screen_w - box_w) // 2, (screen_h - len(lines) - 2) // 2
         for row in range(len(lines) + 2):
@@ -608,7 +748,7 @@ def demo_state(start, paused=False, volume=65, paused_at=None):
                        "volume_steps": 100, "track": track, "next_track": {"name": "Your next discovery"}}}
 
 
-def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: False):
+def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: False, library=None):
     curses.curs_set(0)
     window.keypad(True)
     window.timeout(50)
@@ -619,8 +759,26 @@ def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: Fals
     start = time.monotonic()
     demo_paused, demo_volume = False, 65
     demo_paused_at = None
+    library_open, selection, library_offset = False, 0, 0
+    demo_removed, demo_track = set(), None
     while not should_stop():
         state = demo_state(start, demo_paused, demo_volume, demo_paused_at) if demo else worker.snapshot()
+        status = state.get("status") or {}
+        if demo and demo_track:
+            status["track"].update(demo_track)
+        current_uri = library_track_uri(status.get("track") or {})
+        if demo:
+            library_state = demo_library_state(library_offset, current_uri, demo_removed)
+        elif library is not None:
+            library.observe(status.get("username", ""), current_uri,
+                            bool(state.get("ready") and state.get("connected")))
+            library_state = library.snapshot()
+        else:
+            library_state = {}
+        items = library_state.get("items") or []
+        selection = max(0, min(selection, len(items) - 1))
+        state = dict(state, library=library_state, library_open=library_open,
+                     library_selection=selection)
         if demo:
             age = time.monotonic() - start
             audio = ([0 if demo_paused else (0.4 + 0.3 * math.sin(i * 0.4 + age * 2)) * (1 - i / 45) for i in range(32)],
@@ -636,15 +794,93 @@ def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: Fals
             continue
         if key in ("q", "\x03"):
             break
-        if key in ("?", "\x1b"):
-            help_open = not help_open if key == "?" else False
+        if key == "?":
+            help_open = not help_open
+            continue
+        if key == "\x1b":
+            if help_open:
+                help_open = False
+            else:
+                library_open = False
             continue
         if help_open:
             continue
+        if key == "L":
+            library_open = not library_open
+            if library_open and not demo and library is not None:
+                library.browse(library_state.get("offset", 0))
+            continue
+        if key == "l":
+            if not re.fullmatch(r"spotify:track:[A-Za-z0-9]{22}", current_uri):
+                notice = "There is no Spotify song playing to like."
+            elif demo:
+                if current_uri in demo_removed:
+                    demo_removed.remove(current_uri)
+                else:
+                    demo_removed.add(current_uri)
+                notice = "Demo: liked songs changed only in this preview."
+            elif library is None or not state.get("ready") or not state.get("connected"):
+                notice = "Waiting for Spotify to connect…"
+            elif library_state.get("like_pending"):
+                notice = "A like change is already in progress…"
+            else:
+                library.toggle(current_uri)
+                notice = ""
+            notice_until = time.monotonic() + 4
+            continue
+        if library_open:
+            if key in (curses.KEY_UP, "k", curses.KEY_DOWN, "j"):
+                selection = max(0, min(len(items) - 1, selection +
+                                       (-1 if key in (curses.KEY_UP, "k") else 1)))
+                continue
+            if key in (curses.KEY_PPAGE, "[", curses.KEY_NPAGE, "]", "r"):
+                if not library_state.get("loading"):
+                    offset = library_state.get("offset", 0)
+                    limit = max(1, library_state.get("limit", 20))
+                    if key in (curses.KEY_PPAGE, "["):
+                        offset = max(0, offset - limit)
+                    elif key in (curses.KEY_NPAGE, "]"):
+                        if not library_state.get("has_next"):
+                            continue
+                        offset += limit
+                    selection = 0
+                    if demo:
+                        library_offset = offset
+                    elif library is not None:
+                        if key == "r":
+                            library.browse(offset, refresh=True)
+                        else:
+                            library.browse(offset)
+                continue
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                selected = items[selection] if items else None
+                if library_state.get("loading"):
+                    notice = "Wait for your liked songs to finish loading."
+                elif not selected:
+                    notice = "There is no liked song to play."
+                elif selected.get("playable") is False or not re.fullmatch(
+                        r"spotify:track:[A-Za-z0-9]{22}", selected.get("uri") or ""):
+                    notice = "This liked song is unavailable for playback."
+                elif demo:
+                    demo_track = dict(selected)
+                    start, demo_paused, demo_paused_at = time.monotonic(), False, None
+                    library_open = False
+                    notice = "Demo: playing the selected preview song."
+                elif not state.get("ready") or not state.get("connected") or not status.get("username"):
+                    notice = "Waiting for Spotify to connect…"
+                else:
+                    worker.command("/player/play", {"uri": f"spotify:user:{status['username']}:collection",
+                                                    "skip_to_uri": selected["uri"]})
+                    library_open = False
+                    notice = "Opening your liked song…"
+                notice_until = time.monotonic() + 4
+                continue
         if key == "v":
             mode = (mode + 1) % 3
             continue
         if key in ("d", "D", "b"):
+            if key in ("d", "D"):
+                library_open = False
             if demo:
                 notice = "Demo mode: no Spotify commands are sent."
             elif key in ("d", "D"):
@@ -716,7 +952,7 @@ def main():
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("run djamp in an interactive terminal")
     os.umask(0o077)
-    player = worker = monitor = None
+    player = worker = monitor = library = None
     shutdown_requested = False
     previous_handlers = {}
 
@@ -737,10 +973,12 @@ def main():
             player = PlayerProcess(api)
             player.start()
             worker, monitor = PlayerWorker(api, autoplay=not args.no_autoplay), AudioMonitor()
+            library = LibraryWorker(api)
             worker.start()
             monitor.start()
+            library.start()
         if not shutdown_requested:
-            curses.wrapper(run_ui, worker, monitor, player, args.demo, should_stop)
+            curses.wrapper(run_ui, worker, monitor, player, args.demo, should_stop, library=library)
         return 0
     except KeyboardInterrupt:
         return 0
@@ -753,8 +991,12 @@ def main():
         try:
             if worker:
                 worker.stop_event.set()
-            if monitor:
-                monitor.close()
+            try:
+                if library:
+                    library.close()
+            finally:
+                if monitor:
+                    monitor.close()
         finally:
             try:
                 if player:

@@ -20,4 +20,4 @@ classifiers = [
 djamp = "djamp:main"
 
 [tool.setuptools]
-py-modules = ["djamp"]
+py-modules = ["djamp", "djamp_library"]

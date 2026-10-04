@@ -3,7 +3,8 @@
 A compact, CLIamp-inspired terminal Spotify player. It starts Spotify DJ X
 directly, including narration, using your existing go-librespot login. It has a progress bar,
 volume, keyboard controls, output spectrum/waveform views, and recent tracks
-from the current session. It is a custom front end, not a CLIamp plugin.
+from the current session. You can like songs and browse and play your Liked
+Songs collection. It is a custom front end, not a CLIamp plugin.
 
 ## Requirements
 
@@ -119,8 +120,41 @@ not install or change go-librespot, its credentials, or your audio service.
 | o | Paste a Spotify link or URI to play |
 | d / D | Start the next Spotify DJ set |
 | b | Open Spotify in the browser (fallback) |
+| l | Like/unlike the currently playing song |
+| L | Open/close Liked Songs |
+| Up / Down or j / k | Select a song in Liked Songs |
+| PgUp / PgDn or [ / ] | Previous/next library page |
+| Enter | Play the selected liked song |
+| r | Refresh the visible library page |
+| Esc | Close help or return from Liked Songs |
 | ? | Help |
 | q / Ctrl+C | Quit |
+
+## Liked Songs
+
+Library features use your existing backend login. When upgrading from an older
+DJamp checkout, run `make backend`, then quit and restart DJamp to load the new
+backend. No separate Spotify developer account or API credentials are needed.
+
+Press **l** to save the song that is currently playing, or remove it from
+Liked Songs if it is already saved. The like indicator updates after Spotify
+confirms the change. This key always acts on the playing song, including while
+you are browsing.
+
+Press **L** to browse Liked Songs, then use **Up/Down** or **j/k** to select a
+row and **Enter** to play it. Playback starts within your Liked Songs collection,
+so **n/p** continues through that collection. **d/D** returns to a new DJ set.
+Use **PgUp/PgDn** (or **[/]**) to change pages and **r** to refresh changes made
+in another Spotify app. The collection is cached in memory for up to a minute;
+**r** refreshes it and the playing song's like indicator immediately. Unavailable
+tracks cannot be played. If Spotify plays a regional substitute, likes still
+refer to the original song in your collection.
+
+Library requests run separately from playback controls. Errors are shown in the
+interface; a failed save is never displayed as a successful like. The offline
+demo provides sample library rows and never reads or changes your Spotify account.
+
+## DJ sessions and playback
 
 Direct startup uses Spotify's undocumented DJ session endpoint and its
 continuation pages, which may change. Spotify can reuse a recent session, so
@@ -130,10 +164,17 @@ session; it does not force Spotify to regenerate a whole session or prevent
 individual songs from reappearing. A new session from Spotify replaces the old
 continuation. Prefetching upcoming music does not advance the saved position.
 
+If Spotify refuses the audio key needed to play a song, DJamp stops automatic
+skipping and shows a playback error. Wait for the ten-second cooldown, then press
+**Space** to retry the selected song. Playback commands entered during the
+cooldown are discarded, so they do not start running later. Another audio-key
+refusal starts a new cooldown; DJamp does not retry automatically.
+
 This requires DJ availability on your account. Voice followed by music
 has been verified live on the existing account; first-ever DJ setup has not.
-This version does not browse your full Spotify library or change the DJ's mood. Track links,
-playlist links and the current DJ session use the same playback engine.
+Library browsing currently covers Liked Songs. This version does not yet browse
+your playlists or albums, or change the DJ's mood. Track links, playlist links
+and the current DJ session use the same playback engine.
 An upcoming title is shown only when go-librespot provides it; the recent
 list is session history, not a fabricated DJ queue.
 
@@ -163,7 +204,8 @@ To use the original backend again, quit DJamp, run
 terminal, then run `djamp --no-autoplay`. Start DJ through Spotify as before.
 The same saved login and configuration are used.
 
-API contracts follow the [go-librespot v0.10.2 specification](https://github.com/devgianlu/go-librespot/blob/v0.10.2/api-spec.yml).
+Player controls follow the [go-librespot v0.10.2 specification](https://github.com/devgianlu/go-librespot/blob/v0.10.2/api-spec.yml).
+DJamp's DJ and library extensions are described in [backend/README.md](backend/README.md).
 
 ## Checks
 
@@ -179,3 +221,9 @@ on shutdown signals, including leaving attached players running. Startup tests
 cover waiting for authentication, preserving active sessions, explicit DJ
 requests, unsupported backends, and failed starts without automatic retries. Live Spotify
 and desktop audio require testing from a normal desktop terminal.
+
+Library tests cover pagination, unavailable songs, confirmed likes, regional
+substitutes, refreshed like status, account and track changes during requests,
+failed writes, demo isolation, and keyboard navigation at the minimum terminal size.
+Recovery tests cover persistent playback errors, cooldown input, manual retry,
+queued control cancellation, duplicate DJ starts, and connection loss.

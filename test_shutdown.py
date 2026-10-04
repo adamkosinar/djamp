@@ -30,8 +30,9 @@ djamp.LOG = root / 'state/player.log'
 djamp.API = lambda: Mock(request=Mock(return_value={'playback_ready': True})) if mode == 'attached' else Mock(request=Mock(side_effect=ConnectionRefusedError))
 djamp.PlayerWorker = lambda api, **kwargs: Mock()
 djamp.AudioMonitor = lambda: Mock()
+djamp.LibraryWorker = lambda api: Mock()
 
-def wait_for_stop(function, *args):
+def wait_for_stop(function, *args, **kwargs):
     (root / 'ui.ready').touch()
     while not args[-1]():
         time.sleep(0.01)

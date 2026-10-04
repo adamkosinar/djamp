@@ -61,6 +61,7 @@ class TestStartupOptions(unittest.TestCase):
                 player = stack.enter_context(patch("djamp.PlayerProcess"))
                 worker = stack.enter_context(patch("djamp.PlayerWorker"))
                 monitor = stack.enter_context(patch("djamp.AudioMonitor"))
+                library = stack.enter_context(patch("djamp.LibraryWorker"))
 
                 self.assertEqual(djamp.main(), 0)
                 worker.assert_called_once_with(api.return_value, autoplay=autoplay)
@@ -68,6 +69,9 @@ class TestStartupOptions(unittest.TestCase):
                 worker.return_value.stop_event.set.assert_called_once_with()
                 player.return_value.close.assert_called_once_with()
                 monitor.return_value.close.assert_called_once_with()
+                library.assert_called_once_with(api.return_value)
+                library.return_value.start.assert_called_once_with()
+                library.return_value.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

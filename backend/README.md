@@ -2,7 +2,7 @@
 
 `upstream.env` pins go-librespot v0.10.2 to commit
 `6a3e25019de8d2893b3fa26b0273d8cc376241c5`. The local build reports
-`0.10.2-djamp.2`; it is an unofficial DJamp extension.
+`0.10.2-djamp.5`; it is an unofficial DJamp extension.
 
 The patch changes resolution of exactly
 `spotify:playlist:37i9dQZF1EYkqdzj48dyYq`: `POST /player/play` asks Spotify's
@@ -44,6 +44,52 @@ The OpenAPI source and generated Go model are updated together. Unit tests
 cover routing, result preservation, errors, consecutive DJ sets, account/root
 changes, playback versus prefetch, private persistence and capability serialization.
 
+Opaque audio-key refusals stop playback instead of automatically skipping songs.
+The loader enforces a ten-second cooldown across playback controls, transfers,
+and background audio fetches, discarding pending playback work. Ordinary queue
+edits and volume changes remain independent. A failed background prefetch leaves
+an already-playing primary stream alone.
+
+`GET /status` includes an optional `playback_error` object with `kind`, `message`,
+`uri`, and the remaining `retry_after_ms`. Its message is safe for display and
+does not include raw upstream errors. An audio-key refusal is reported as
+`audio_key_refused`, without claiming a country restriction or rate limit.
+The failed selection remains available for manual retry after the cooldown;
+successful playback clears the error. There is no automatic retry on expiry.
+
+The backend also advertises `library: true` and exposes liked-song operations:
+
+- `GET /library/tracks?offset=0&limit=20&username=...` returns a page of tracks
+  with names, artists, albums, duration, availability, and the complete total.
+  Add `refresh=true` to bypass the 60-second collection cache.
+- `GET /library/contains?uri=spotify:track:...&username=...` returns `saved`.
+- `POST /library/save` accepts `{uri, saved, username}` with an explicit boolean
+  and returns the confirmed `saved` value. Account mismatches return HTTP 409.
+
+Playback track metadata includes `requested_uri`, the original track requested
+before any regional substitution, alongside the existing playable `uri`.
+Clients use `requested_uri` for library checks and updates so likes continue to
+refer to the saved version of the song.
+
+These use Spotify's internal collection-v2 paging and write endpoints through
+Login5 authentication. The protocol is supported by
+[Sonora's collection client](https://github.com/sonorahq/sonora/blob/main/crates/music/src/spotify/collection2.rs)
+and the `collection2v2.proto` descriptor in Spotify's desktop binary. The minimal
+schema and generated Go messages are included in the patch; there is no Python
+protobuf implementation or public Web API dependency.
+
+Collection calls run independently of playback with a 25-second timeout and
+at most four pending requests. A cache belongs to one authenticated player;
+complete scans follow pagination, discard removed/non-track items, reject cursor
+cycles, and enforce response/page/item limits. A failed scan never becomes an
+empty library or a false saved status. Only visible tracks need metadata requests.
+Library metadata has its own bounded cache, preserving the original restrictions
+and regional alternatives even after playback selects a substitute version.
+Updates refresh the collection first, preserve an existing like's original added
+timestamp, and use a unique UUID for retry identity. Any attempted update
+invalidates the cache, including ambiguous failures. No collection or token is
+written to the DJamp repository.
+
 From the DJamp repository root, run:
 
 ```sh
@@ -71,9 +117,11 @@ model with the upstream generator, and export the changes including new files:
 
 ```sh
 go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.5.0 --config=api-codegen.yml api-spec.yml
-gofmt -w daemon/dj_context*.go
+# Only when changing the collection schema (protoc and protoc-gen-go required):
+protoc -I proto --go_out=proto --go_opt=paths=source_relative proto/spotify/collection/v2/collection.proto
+gofmt -w daemon/dj_context*.go daemon/library*.go daemon/playback_recovery*.go spclient/collection*.go
 go test -mod=readonly -tags test_unit ./daemon ./spclient ./tracks ./cmd/daemon
-git add -N daemon/dj_context.go daemon/dj_context_test.go daemon/dj_start_test.go tracks/dj_cursor_test.go
+git add -N daemon/dj_context.go daemon/dj_context_test.go daemon/dj_start_test.go tracks/dj_cursor_test.go daemon/library.go daemon/library_test.go daemon/library_api_test.go daemon/library_relink_test.go daemon/api_requested_uri_test.go daemon/playback_recovery.go daemon/playback_recovery_test.go daemon/playback_recovery_transfer_test.go spclient/collection.go spclient/collection_test.go proto/spotify/collection/v2/collection.proto proto/spotify/collection/v2/collection.pb.go
 git diff --binary --src-prefix=a/ --dst-prefix=b/ > /path/to/djamp/backend/go-librespot-dj-start.patch
 ```
 
