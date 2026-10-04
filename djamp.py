@@ -66,6 +66,11 @@ def library_track_uri(track):
     return track.get("requested_uri") or track.get("uri") or ""
 
 
+def is_liked_context(status):
+    username = status.get("username")
+    return bool(username and status.get("context_uri") == f"spotify:user:{username}:collection")
+
+
 def spotify_uri(value):
     value = value.strip()
     pattern = r"spotify:(track|album|playlist|artist|episode|show):[A-Za-z0-9]{22}"
@@ -190,13 +195,82 @@ class PlayerWorker(threading.Thread):
         self.dj_queued = False
         self.dj_started_at = None
         self.previous_track = None
+        self._liked_username = ""
+        # Playback generations cancel delayed work; toggle revisions keep a
+        # status poll from overwriting a newer preference still in the queue.
+        self._liked_generation = 0
+        self._liked_revision = 0
+        self._liked_queued_revision = None
+        self._liked_pending = None
         self.state = {"connected": False, "ready": False, "status": {}, "auth": {},
                       "received": time.monotonic(), "error": "", "notice": "", "recent": [],
-                      "direct_dj": False, "dj_starting": False}
+                      "direct_dj": False, "dj_starting": False,
+                      "liked_shuffle": False, "liked_shuffle_pending": False,
+                      "liked_shuffle_supported": False}
 
     def snapshot(self):
         with self.lock:
             return dict(self.state)
+
+    def _cancel_liked_locked(self, *, invalidate=True):
+        if invalidate:
+            self._liked_generation += 1
+            self._liked_queued_revision = None
+        self._liked_pending = None
+        self.state["liked_shuffle_pending"] = False
+
+    def _liked_account_locked(self, username):
+        if username != self._liked_username:
+            self._cancel_liked_locked()
+            self._liked_username = username
+            self.state["liked_shuffle"] = False
+
+    def _queue_locked(self, path, payload):
+        try:
+            self.commands.put_nowait((path, payload))
+            return True
+        except queue.Full:
+            self.state["notice"] = "Player busy; command was not queued. Try again."
+            return False
+
+    def _liked_allowed_locked(self, username):
+        return bool(username and self.state["connected"] and self.state["ready"] and
+                    username == self._liked_username and
+                    username == self.state["status"].get("username") and
+                    not playback_retry_seconds(self.state))
+
+    def play_liked(self, username, uri):
+        with self.lock:
+            if not self._liked_allowed_locked(username):
+                return False
+            payload = {"username": username, "uri": uri, "shuffle": self.state["liked_shuffle"],
+                       "generation": self._liked_generation + 1}
+            if not self._queue_locked("liked/play", payload):
+                return False
+            self._cancel_liked_locked()
+            self.state["liked_shuffle_pending"] = self.state["liked_shuffle_supported"]
+            return True
+
+    def shuffle_liked(self, username):
+        with self.lock:
+            if not self._liked_allowed_locked(username) or self.state["status"].get("playback_error"):
+                return False
+            if not self.state["liked_shuffle_supported"]:
+                self.state["notice"] = "Update the DJamp backend and restart to enable Liked Songs shuffle."
+                return False
+            value = not self.state["liked_shuffle"]
+            revision = self._liked_revision + 1
+            payload = {"username": username, "shuffle": value,
+                       "generation": self._liked_generation, "revision": revision}
+            if not self._queue_locked("liked/shuffle", payload):
+                return False
+            self._liked_revision = self._liked_queued_revision = revision
+            self.state["liked_shuffle"] = value
+            self.state["liked_shuffle_pending"] = bool(
+                self.state["liked_shuffle_pending"] or is_liked_context(self.state["status"]))
+            if not self.state["dj_starting"]:
+                self.state["notice"] = ""
+            return True
 
     def command(self, path, payload=None):
         is_dj = path == "/player/play" and (payload or {}).get("uri") == DJ_URI
@@ -206,11 +280,10 @@ class PlayerWorker(threading.Thread):
                 return False
             if is_dj and (self.dj_queued or self.state["dj_starting"]):
                 return False
-            try:
-                self.commands.put_nowait((path, payload))
-            except queue.Full:
-                self.state["notice"] = "Player busy; command was not queued. Try again."
+            if not self._queue_locked(path, payload):
                 return False
+            if path in ("/player/play", "/player/stop"):
+                self._cancel_liked_locked()
             if is_dj:
                 self.dj_queued = True
             return True
@@ -230,12 +303,26 @@ class PlayerWorker(threading.Thread):
             for command in volumes:
                 self.commands.put_nowait(command)
             self.dj_queued = False
+            self._cancel_liked_locked()
 
     def _notice(self, message, starting=False):
         with self.lock:
             self.state.update(notice=message, dj_starting=starting)
 
     def _process_command(self, path, payload):
+        if path == "liked/shuffle":
+            self._process_liked_shuffle(payload)
+            return
+        liked_play = payload if path == "liked/play" else None
+        if liked_play:
+            with self.lock:
+                if (liked_play["generation"] != self._liked_generation or
+                        not self._liked_allowed_locked(liked_play["username"])):
+                    return
+                self.state["liked_shuffle_pending"] = self.state["liked_shuffle_supported"]
+            path = "/player/play"
+            payload = {"uri": f"spotify:user:{liked_play['username']}:collection",
+                       "skip_to_uri": liked_play["uri"]}
         is_dj = path == "/player/play" and (payload or {}).get("uri") == DJ_URI
         with self.lock:
             if is_dj:
@@ -256,7 +343,19 @@ class PlayerWorker(threading.Thread):
                 self._notice("Waiting for Spotify to start DJ X…", starting=True)
                 return
         try:
+            if liked_play:
+                status = self.api.request("/status") or {}
+                with self.lock:
+                    self._liked_account_locked(status.get("username") or "")
+                    if (liked_play["username"] != status.get("username") or
+                            liked_play["generation"] != self._liked_generation):
+                        return
             self.api.request(path, payload, post=True)
+            if liked_play:
+                with self.lock:
+                    if (liked_play["generation"] == self._liked_generation and
+                            self.state["liked_shuffle_supported"]):
+                        self._liked_pending = dict(liked_play, sent=False, deadline=time.monotonic() + 30)
             if not self.dj_requested and self.dj_started_at is None:
                 self._notice("")
         except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
@@ -264,7 +363,95 @@ class PlayerWorker(threading.Thread):
                 self._discard_playback_commands()
             self._notice(clean(exc), starting=self.dj_requested or self.dj_started_at is not None)
 
+    def _process_liked_shuffle(self, payload):
+        with self.lock:
+            if (payload["username"] != self._liked_username or
+                    payload["generation"] != self._liked_generation or
+                    payload["revision"] != self._liked_queued_revision):
+                return
+        try:
+            # UI state may predate a Spotify Connect context/account change.
+            root = self.api.request("/")
+            if not root.get("liked_shuffle"):
+                with self.lock:
+                    self._cancel_liked_locked(invalidate=False)
+                    self._liked_queued_revision = None
+                    self.state.update(liked_shuffle=False, liked_shuffle_supported=False,
+                                      notice="Update the DJamp backend and restart to enable Liked Songs shuffle.")
+                return
+            status = self.api.request("/status") or {}
+            with self.lock:
+                self._liked_account_locked(status.get("username") or "")
+                if (payload["username"] != status.get("username") or
+                        payload["generation"] != self._liked_generation or
+                        payload["revision"] != self._liked_queued_revision):
+                    return
+                self._liked_queued_revision = None
+                if playback_retry_seconds(self.state) or status.get("playback_error"):
+                    self._cancel_liked_locked()
+                    return
+                if self._liked_pending is not None:
+                    self._liked_pending.update(shuffle=payload["shuffle"], sent=False)
+                elif is_liked_context(status) and not self.dj_requested and not self.dj_queued and self.dj_started_at is None:
+                    self._liked_pending = dict(payload, sent=False, deadline=time.monotonic() + 10)
+                self.state["liked_shuffle_pending"] = self._liked_pending is not None
+            self._reconcile_liked(status)
+        except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
+            self._discard_playback_commands()
+            self._notice(clean(exc), starting=self.dj_requested or self.dj_started_at is not None)
+
+    def _reconcile_liked(self, status):
+        """Apply only after collection playback; HTTP success is not confirmation."""
+        with self.lock:
+            self._liked_account_locked(status.get("username") or "")
+            active = is_liked_context(status)
+            observed = status.get("shuffle_context")
+            if (not self.state["ready"] or not self.state["liked_shuffle_supported"] or
+                    status.get("playback_error")):
+                self._cancel_liked_locked(invalidate=False)
+                if active and isinstance(observed, bool):
+                    self.state["liked_shuffle"] = observed
+                return
+            if self.dj_requested or self.dj_queued or self.dj_started_at is not None:
+                self._cancel_liked_locked(invalidate=False)
+                return
+            if self._liked_queued_revision is not None:
+                return
+            pending = self._liked_pending
+            if pending is None:
+                if active and isinstance(observed, bool) and not self.state["liked_shuffle_pending"]:
+                    self.state["liked_shuffle"] = observed
+                return
+            if time.monotonic() >= pending["deadline"]:
+                self._cancel_liked_locked(invalidate=False)
+                if active and isinstance(observed, bool):
+                    self.state["liked_shuffle"] = observed
+                self.state["notice"] = "Could not confirm Liked Songs shuffle. Press s to retry."
+                return
+            if not active:
+                # The play acknowledgement already claims its new context;
+                # a different context now means another playback choice won.
+                self._cancel_liked_locked(invalidate=False)
+                return
+            if status.get("buffering") or status.get("stopped") or not status.get("track"):
+                return
+            if observed is pending["shuffle"]:
+                self._liked_pending = None
+                self.state["liked_shuffle_pending"] = False
+                self.state["liked_shuffle"] = observed
+                return
+            if pending["sent"]:
+                return
+            pending.update(sent=True, deadline=time.monotonic() + 10)
+            value = pending["shuffle"]
+        # This runs on the playback worker immediately after a fresh status
+        # read, never before play (which would shuffle the previous context).
+        self.api.request("/player/shuffle_context", {"shuffle_context": value,
+                         "context_uri": status["context_uri"]}, post=True)
+
     def _start_dj(self, supported):
+        with self.lock:
+            self._cancel_liked_locked(invalidate=False)
         self.dj_requested = False
         if not supported:
             self._notice("Close the previous player and restart DJamp to enable DJ startup. b opens Spotify.")
@@ -283,6 +470,8 @@ class PlayerWorker(threading.Thread):
         auth = self.api.request("/auth/code")
         if auth.get("code"):
             with self.lock:
+                self._liked_account_locked("")
+                self._cancel_liked_locked()
                 self.state.update(connected=True, ready=False, status={}, auth=auth, error="")
             return
         root = self.api.request("/")
@@ -291,6 +480,7 @@ class PlayerWorker(threading.Thread):
         track = status.get("track") or {}
         failure = status.get("playback_error")
         with self.lock:
+            self._liked_account_locked(status.get("username") or "")
             previous_failure = (self.state.get("status") or {}).get("playback_error")
             recent = list(self.state["recent"])
             if track.get("uri") and self.previous_track and track["uri"] != self.previous_track.get("uri"):
@@ -298,8 +488,12 @@ class PlayerWorker(threading.Thread):
             if track.get("uri"):
                 self.previous_track = track
             self.state.update(connected=True, ready=ready, direct_dj=bool(root.get("direct_dj")),
+                              liked_shuffle_supported=bool(root.get("liked_shuffle")),
                               status=status, auth=auth, received=time.monotonic(), error="",
                               recent=recent[:40])
+            if not self.state["liked_shuffle_supported"]:
+                self.state["liked_shuffle"] = False
+                self._liked_queued_revision = None
 
         if failure:
             # Failed idle playback is not a fresh session to autostart. Repeated
@@ -327,6 +521,7 @@ class PlayerWorker(threading.Thread):
                 self.dj_requested = True
         if self.dj_requested and ready and not self.stop_event.is_set():
             self._start_dj(bool(root.get("direct_dj")))
+        self._reconcile_liked(status)
 
     def run(self):
         next_poll = 0
@@ -344,6 +539,7 @@ class PlayerWorker(threading.Thread):
                 self._poll()
             except (OSError, RuntimeError, ValueError, http.client.HTTPException) as exc:
                 with self.lock:
+                    self._cancel_liked_locked()
                     self.state.update(connected=False, error=clean(exc))
 
 
@@ -496,13 +692,17 @@ def palette():
     return result
 
 
-def render_library(canvas, library, selection, y, x, height, width):
+def render_library(canvas, library, selection, y, x, height, width, *, shuffle=False, shuffle_pending=False):
     items = library.get("items") or []
     offset, total = library.get("offset", 0), library.get("total", 0)
     end = offset + len(items)
-    title = f"LIKED SONGS · {offset + 1}–{end} / {total}" if items else "LIKED SONGS"
+    title = "LIKED SONGS · SHUFFLE " + ("ON" if shuffle else "OFF") + ("…" if shuffle_pending else "")
     if library.get("loading"):
         title += " · loading"
+    elif items:
+        page = f" · {offset + 1}–{end} / {total}"
+        if cell_width(title + page) <= width - 7:
+            title += page
     canvas.box(y, x, height, width, title)
     if not items:
         message = ("Loading your liked songs…" if library.get("loading") else
@@ -625,9 +825,17 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
     volume_bar = "▰" * round(volume / 10) + "▱" * (10 - round(volume / 10))
     canvas.put(top + 11, left + width - 21, f"{volume_bar} {volume:3d}%", "accent")
 
+    if is_liked_context(status) and not library_open:
+        shuffle_label = "LIKED · SHUFFLE " + ("ON" if state.get("liked_shuffle") else "OFF")
+        if state.get("liked_shuffle_pending"):
+            shuffle_label += "…"
+        canvas.put(top + 12, left + 2, shuffle_label + " · s toggle", "accent", width=width - 4)
+
     if library_open:
         render_library(canvas, library, state.get("library_selection", 0),
-                       top + 13, left, height - 16, width)
+                       top + 13, left, height - 16, width,
+                       shuffle=state.get("liked_shuffle", False),
+                       shuffle_pending=state.get("liked_shuffle_pending", False))
     else:
         visual_h = min(10, max(5, height - 25))
         visual_y = top + 13
@@ -675,7 +883,8 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
             if not state.get("recent") and list_h > 4:
                 canvas.put(list_y + 3, left + 3, "Recently played tracks appear here as your session continues.", "muted", width=width - 6)
         else:
-            canvas.put(list_y, left + 2, "NEXT  " + (next_track.get("name") or "Selected by your DJ"), "muted", width=width - 4)
+            next_name = next_track.get("name") or ("Selected by your DJ" if "dj" in context.lower() else "Waiting for the next track")
+            canvas.put(list_y, left + 2, "NEXT  " + next_name, "muted", width=width - 4)
 
     codec = (track.get("codec") or "").upper()
     bitrate = track.get("bitrate")
@@ -686,12 +895,15 @@ def render(canvas, state, audio, mode=0, notice="", demo=False, show_help=False)
     if width < 82:
         keys = "space play · l like · L liked · d DJ · ? · q quit"
     if library_open:
-        keys = "↑↓ choose · enter play · [ ] page · Esc back · ? help"
+        keys = "↑↓ choose · enter play · s shuffle · [ ] page · Esc back · ? help"
+        if width < 82:
+            keys = "↑↓ · enter play · s shuffle · [ ] · Esc · ? · q"
     canvas.put(top + height - 1, left + 1, keys, "cyan", width=width - 2)
     if show_help:
         lines = ["KEYBOARD CONTROLS", "", "Space         Play / pause", "n / p         Next / previous track",
                  "← / →         Seek 10 seconds", "+ / - / m     Volume / mute",
                  "l             Like/unlike PLAYING song", "L             Open / close liked songs",
+                 "s             Shuffle liked songs on/off",
                  "↑↓ / j k      Select a liked song", "PgUp/PgDn [ ] Library pages",
                  "Enter         Play selected liked song", "r             Refresh library page",
                  "Esc           Return to player", "d / D         Start the next DJ set",
@@ -745,6 +957,7 @@ def demo_state(start, paused=False, volume=65, paused_at=None):
              "duration": 243000, "codec": "vorbis", "bitrate": 320}
     return {"connected": True, "ready": True, "received": now, "recent": [],
             "status": {"paused": paused, "stopped": False, "context_name": "DJ X", "volume": volume,
+                       "username": "demo", "context_uri": DJ_URI, "shuffle_context": False,
                        "volume_steps": 100, "track": track, "next_track": {"name": "Your next discovery"}}}
 
 
@@ -761,11 +974,16 @@ def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: Fals
     demo_paused_at = None
     library_open, selection, library_offset = False, 0, 0
     demo_removed, demo_track = set(), None
+    demo_shuffle = False
     while not should_stop():
         state = demo_state(start, demo_paused, demo_volume, demo_paused_at) if demo else worker.snapshot()
         status = state.get("status") or {}
         if demo and demo_track:
             status["track"].update(demo_track)
+            status.update(context_name="Liked Songs", context_uri="spotify:user:demo:collection",
+                          shuffle_context=demo_shuffle, next_track={})
+        if demo:
+            state["liked_shuffle"] = demo_shuffle
         current_uri = library_track_uri(status.get("track") or {})
         if demo:
             library_state = demo_library_state(library_offset, current_uri, demo_removed)
@@ -828,6 +1046,19 @@ def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: Fals
                 notice = ""
             notice_until = time.monotonic() + 4
             continue
+        if key == "s":
+            if not library_open and not is_liked_context(status):
+                notice = "Open Liked Songs with L to choose shuffle."
+            elif demo:
+                demo_shuffle = not demo_shuffle
+                notice = "Demo: shuffle changed only in this preview."
+            elif not state.get("ready") or not state.get("connected") or not status.get("username"):
+                notice = "Waiting for Spotify to connect…"
+            else:
+                worker.shuffle_liked(status["username"])
+                notice = ""
+            notice_until = time.monotonic() + 4
+            continue
         if library_open:
             if key in (curses.KEY_UP, "k", curses.KEY_DOWN, "j"):
                 selection = max(0, min(len(items) - 1, selection +
@@ -869,8 +1100,7 @@ def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: Fals
                 elif not state.get("ready") or not state.get("connected") or not status.get("username"):
                     notice = "Waiting for Spotify to connect…"
                 else:
-                    if worker.command("/player/play", {"uri": f"spotify:user:{status['username']}:collection",
-                                                       "skip_to_uri": selected["uri"]}):
+                    if worker.play_liked(status["username"], selected["uri"]):
                         library_open = False
                         notice = "Opening your liked song…"
                     else:

@@ -1,5 +1,5 @@
 diff --git a/api-spec.yml b/api-spec.yml
-index 662db9f..317ad08 100644
+index 662db9f..9142784 100644
 --- a/api-spec.yml
 +++ b/api-spec.yml
 @@ -37,8 +37,12 @@ components:
@@ -53,13 +53,16 @@ index 662db9f..317ad08 100644
          buffering:
            description: Whether the player is buffering
            type: boolean
-@@ -248,13 +275,76 @@ components:
+@@ -248,13 +275,79 @@ components:
        x-go-name: ApiRoot
        description: API reachability and playback readiness
        type: object
 -      required: [ playback_ready ]
-+      required: [ playback_ready, direct_dj, library ]
++      required: [ playback_ready, direct_dj, library, liked_shuffle ]
        properties:
++        liked_shuffle:
++          description: Whether context-bound shuffle changes for the authenticated account's Liked Songs are supported
++          type: boolean
 +        library:
 +          description: Whether liked-song browsing and saving are supported
 +          type: boolean
@@ -131,7 +134,22 @@ index 662db9f..317ad08 100644
      volume:
        x-go-name: ApiVolume
        description: The player volume settings
-@@ -421,6 +511,82 @@ components:
+@@ -387,6 +480,14 @@ components:
+       type: object
+       required: [ shuffle_context ]
+       properties:
++        context_uri:
++          description: >-
++            Optional guard requiring this URI to be the currently loaded Liked
++            Songs collection of the authenticated account. Requires liked_shuffle
++            capability. A changed account/context, loading or failed playback,
++            cooldown, or shuffle restriction returns HTTP 409 without changing
++            playback. Omitting this field preserves the legacy unscoped toggle.
++          type: string
+         shuffle_context:
+           description: Whether shuffling context should be enabled
+           type: boolean
+@@ -421,6 +522,82 @@ components:
            x-go-type-skip-optional-pointer: true
  
  paths:
@@ -214,6 +232,15 @@ index 662db9f..317ad08 100644
    /:
      get:
        operationId: getRoot
+@@ -707,6 +884,8 @@ paths:
+       responses:
+         200:
+           description: Successful response
++        409:
++          description: The guarded Liked Songs context is no longer available for shuffle
+   /player/add_to_queue:
+     post:
+       operationId: playerAddToQueue
 diff --git a/cmd/daemon/file_state_store_test.go b/cmd/daemon/file_state_store_test.go
 index 343a799..11b63bc 100644
 --- a/cmd/daemon/file_state_store_test.go
@@ -260,7 +287,7 @@ index 343a799..11b63bc 100644
 +	require.Len(t, entries, 1, "atomic saves should leave no temporary files")
 +}
 diff --git a/daemon/api_gen.go b/daemon/api_gen.go
-index 4be8c8d..e2ef0ae 100644
+index 4be8c8d..2777473 100644
 --- a/daemon/api_gen.go
 +++ b/daemon/api_gen.go
 @@ -66,6 +66,43 @@ type ApiDeviceAuth struct {
@@ -329,7 +356,7 @@ index 4be8c8d..e2ef0ae 100644
  // ApiRepeatContext A toggle repeating context payload
  type ApiRepeatContext struct {
  	// RepeatContext Whether repeating context should be enabled
-@@ -107,6 +159,12 @@ type ApiRepeatTrack struct {
+@@ -107,6 +159,15 @@ type ApiRepeatTrack struct {
  
  // ApiRoot API reachability and playback readiness
  type ApiRoot struct {
@@ -339,10 +366,23 @@ index 4be8c8d..e2ef0ae 100644
 +	// Library Whether liked-song browsing and saving are supported
 +	Library bool `json:"library"`
 +
++	// LikedShuffle Whether context-bound shuffle changes for the authenticated account's Liked Songs are supported
++	LikedShuffle bool `json:"liked_shuffle"`
++
  	// PlaybackReady Whether the daemon is fully bootstrapped and ready to accept /player/play
  	PlaybackReady bool `json:"playback_ready"`
  }
-@@ -173,6 +231,9 @@ type ApiStatus struct {
+@@ -137,6 +198,9 @@ type ApiSetVolume struct {
+ 
+ // ApiShuffleContext A toggle shuffling context payload
+ type ApiShuffleContext struct {
++	// ContextUri Optional guard requiring this URI to be the currently loaded Liked Songs collection of the authenticated account. Requires liked_shuffle capability. A changed account/context, loading or failed playback, cooldown, or shuffle restriction returns HTTP 409 without changing playback. Omitting this field preserves the legacy unscoped toggle.
++	ContextUri *string `json:"context_uri,omitempty"`
++
+ 	// ShuffleContext Whether shuffling context should be enabled
+ 	ShuffleContext bool `json:"shuffle_context"`
+ }
+@@ -173,6 +237,9 @@ type ApiStatus struct {
  	// PlayOriginDeviceId The device ID that sent the command starting the playback, null when the playback was started locally through this API
  	PlayOriginDeviceId *string `json:"play_origin_device_id"`
  
@@ -352,7 +392,7 @@ index 4be8c8d..e2ef0ae 100644
  	// RepeatContext Whether the repeat context feature is enabled
  	RepeatContext bool `json:"repeat_context"`
  
-@@ -240,13 +301,16 @@ type ApiTrack struct {
+@@ -240,13 +307,16 @@ type ApiTrack struct {
  	// ReleaseDate Album release date, empty for episodes
  	ReleaseDate string `json:"release_date"`
  
@@ -370,7 +410,7 @@ index 4be8c8d..e2ef0ae 100644
  	Uri string `json:"uri"`
  }
  
-@@ -268,6 +332,23 @@ type GetContextTracksParams struct {
+@@ -268,6 +338,23 @@ type GetContextTracksParams struct {
  	Uri string `form:"uri" json:"uri"`
  }
  
@@ -394,7 +434,7 @@ index 4be8c8d..e2ef0ae 100644
  // PlayerAddToQueueJSONRequestBody defines body for PlayerAddToQueue for application/json ContentType.
  type PlayerAddToQueueJSONRequestBody = ApiAddToQueue
  
-@@ -313,6 +394,15 @@ type ServerInterface interface {
+@@ -313,6 +400,15 @@ type ServerInterface interface {
  	// (GET /events)
  	GetEvents(w http.ResponseWriter, r *http.Request)
  
@@ -410,7 +450,7 @@ index 4be8c8d..e2ef0ae 100644
  	// (POST /player/add_to_queue)
  	PlayerAddToQueue(w http.ResponseWriter, r *http.Request)
  
-@@ -453,6 +543,120 @@ func (siw *ServerInterfaceWrapper) GetEvents(w http.ResponseWriter, r *http.Requ
+@@ -453,6 +549,120 @@ func (siw *ServerInterfaceWrapper) GetEvents(w http.ResponseWriter, r *http.Requ
  	handler.ServeHTTP(w, r)
  }
  
@@ -531,7 +571,7 @@ index 4be8c8d..e2ef0ae 100644
  // PlayerAddToQueue operation middleware
  func (siw *ServerInterfaceWrapper) PlayerAddToQueue(w http.ResponseWriter, r *http.Request) {
  
-@@ -829,6 +1033,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
+@@ -829,6 +1039,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
  	m.HandleFunc("GET "+options.BaseURL+"/auth/code", wrapper.GetAuthCode)
  	m.HandleFunc("GET "+options.BaseURL+"/context/tracks", wrapper.GetContextTracks)
  	m.HandleFunc("GET "+options.BaseURL+"/events", wrapper.GetEvents)
@@ -688,7 +728,7 @@ index 0000000..624ce68
 +	}
 +}
 diff --git a/daemon/api_server.go b/daemon/api_server.go
-index 02bf0b2..f34d5af 100644
+index 02bf0b2..0d6e668 100644
 --- a/daemon/api_server.go
 +++ b/daemon/api_server.go
 @@ -6,8 +6,10 @@ import (
@@ -702,15 +742,22 @@ index 02bf0b2..f34d5af 100644
  	"strings"
  	"sync"
  	"sync/atomic"
-@@ -97,6 +99,7 @@ func (c *wsClient) send(log librespot.Logger, ev *ApiEvent) bool {
+@@ -97,6 +99,8 @@ func (c *wsClient) send(log librespot.Logger, ev *ApiEvent) bool {
  }
  
  var (
 +	ErrConflictAccount  = errors.New("Spotify account changed")
++	ErrShuffleConflict  = errors.New("Liked Songs context is not available for shuffle")
  	ErrNoSession        = errors.New("no session")
  	ErrBadRequest       = errors.New("bad request")
  	ErrForbidden        = errors.New("forbidden")
-@@ -128,6 +131,9 @@ const (
+@@ -123,11 +127,15 @@ const (
+ 	ApiRequestTypeSetRepeatingContext ApiRequestType = "repeating_context"
+ 	ApiRequestTypeSetRepeatingTrack   ApiRequestType = "repeating_track"
+ 	ApiRequestTypeSetShufflingContext ApiRequestType = "shuffling_context"
++	ApiRequestTypeSetLikedShuffle     ApiRequestType = "liked_shuffle"
+ 	ApiRequestTypeAddToQueue          ApiRequestType = "add_to_queue"
+ 	ApiRequestTypeToken               ApiRequestType = "token"
  	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
  	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
  	ApiRequestTypeContextTracks       ApiRequestType = "context_tracks"
@@ -720,7 +767,7 @@ index 02bf0b2..f34d5af 100644
  )
  
  // ApiRequestDataContextTracks carries the uri query parameter of the context
-@@ -234,6 +240,16 @@ func (p *AppPlayer) newApiResponseStatusTrack(stream *player.Stream, position in
+@@ -234,6 +242,16 @@ func (p *AppPlayer) newApiResponseStatusTrack(stream *player.Stream, position in
  	media := stream.Media
  
  	resp := p.newApiResponseStatusMedia(media, position)
@@ -737,7 +784,7 @@ index 02bf0b2..f34d5af 100644
  
  	// The file is what actually got decoded, so report from it rather than from
  	// the requested bitrate: they differ whenever the preferred format was not
-@@ -434,7 +450,11 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
+@@ -434,7 +452,11 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
  		case errors.Is(resp.err, ErrTooManyRequests):
  			w.WriteHeader(http.StatusTooManyRequests)
  			return
@@ -746,11 +793,22 @@ index 02bf0b2..f34d5af 100644
 +			w.WriteHeader(http.StatusServiceUnavailable)
 +			_, _ = io.WriteString(w, errPlaybackCooldown.Error())
 +			return
-+		case errors.Is(resp.err, ErrSuperseded), errors.Is(resp.err, ErrLoaderBusy), errors.Is(resp.err, ErrConflictAccount):
++		case errors.Is(resp.err, ErrSuperseded), errors.Is(resp.err, ErrLoaderBusy), errors.Is(resp.err, ErrConflictAccount), errors.Is(resp.err, ErrShuffleConflict):
  			w.WriteHeader(http.StatusConflict)
  			return
  		case errors.Is(resp.err, ErrBadRequest):
-@@ -706,21 +726,26 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
+@@ -610,6 +632,10 @@ func (s *ConcreteApiServer) PlayerShuffleContext(w http.ResponseWriter, r *http.
+ 		return
+ 	}
+ 
++	if data.ContextUri != nil {
++		s.handleRequest(ApiRequest{Type: ApiRequestTypeSetLikedShuffle, Data: data}, w)
++		return
++	}
+ 	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetShufflingContext, Data: data.ShuffleContext}, w)
+ }
+ 
+@@ -706,21 +732,26 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
  	}
  }
  
@@ -784,7 +842,7 @@ index 02bf0b2..f34d5af 100644
  	}
  
  	if s.close.Load() {
-@@ -784,3 +809,67 @@ func (s *ConcreteApiServer) Close() error {
+@@ -784,3 +815,67 @@ func (s *ConcreteApiServer) Close() error {
  	_ = s.listener.Close()
  	return nil
  }
@@ -853,7 +911,7 @@ index 02bf0b2..f34d5af 100644
 +	return s.cors().OriginAllowed(r)
 +}
 diff --git a/daemon/api_server_test.go b/daemon/api_server_test.go
-index 63aa856..dfb98c2 100644
+index 63aa856..1c6c3bd 100644
 --- a/daemon/api_server_test.go
 +++ b/daemon/api_server_test.go
 @@ -167,13 +167,13 @@ func TestApiRejectsWrongMethod(t *testing.T) {
@@ -861,19 +919,19 @@ index 63aa856..dfb98c2 100644
  func TestApiRoot(t *testing.T) {
  	ts := newTestServer(t, func(ApiRequest) (any, error) {
 -		return &ApiRoot{PlaybackReady: true}, nil
-+		return &ApiRoot{PlaybackReady: true, DirectDj: true, Library: true}, nil
++		return &ApiRoot{PlaybackReady: true, DirectDj: true, Library: true, LikedShuffle: true}, nil
  	})
  
  	resp := ts.do(http.MethodGet, "/", nil)
  	require.Equal(t, http.StatusOK, resp.StatusCode)
  	require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 -	require.JSONEq(t, `{"playback_ready":true}`, body(t, resp))
-+	require.JSONEq(t, `{"playback_ready":true,"direct_dj":true,"library":true}`, body(t, resp))
++	require.JSONEq(t, `{"playback_ready":true,"direct_dj":true,"library":true,"liked_shuffle":true}`, body(t, resp))
  
  	require.Equal(t, ApiRequestTypeRoot, ts.request().Type)
  }
 diff --git a/daemon/app.go b/daemon/app.go
-index 1479539..e9f2b19 100644
+index 1479539..d0a1325 100644
 --- a/daemon/app.go
 +++ b/daemon/app.go
 @@ -59,7 +59,8 @@ type App struct {
@@ -922,12 +980,12 @@ index 1479539..e9f2b19 100644
  					switch req.Type {
  					case ApiRequestTypeRoot:
 -						req.Reply(&ApiRoot{}, nil)
-+						req.Reply(&ApiRoot{DirectDj: true, Library: true}, nil)
++						req.Reply(&ApiRoot{DirectDj: true, Library: true, LikedShuffle: true}, nil)
  					case ApiRequestSetDeviceName:
  						// The device name drives the zeroconf advertisement, which
  						// runs independently of any player session, so handle it
 diff --git a/daemon/controls.go b/daemon/controls.go
-index 27f3dd1..0d592aa 100644
+index 27f3dd1..5394abd 100644
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
 @@ -14,7 +14,6 @@ import (
@@ -1208,7 +1266,89 @@ index 27f3dd1..0d592aa 100644
  	p.updateState()
  	p.schedulePrefetchNext()
  
-@@ -1208,7 +1282,32 @@ func (p *AppPlayer) setQueue(prev []*connectpb.ContextTrack, next []*connectpb.C
+@@ -1074,8 +1148,9 @@ func (p *AppPlayer) setModes(modes map[string]string) {
+ 	}
+ }
+ 
+-func (p *AppPlayer) setOptions(repeatingContext *bool, repeatingTrack *bool, shufflingContext *bool) {
++func (p *AppPlayer) setOptions(repeatingContext *bool, repeatingTrack *bool, shufflingContext *bool) error {
+ 	var requiresUpdate bool
++	var submissionErr error
+ 	if repeatingContext != nil && *repeatingContext != p.state.player.Options.RepeatingContext {
+ 		p.state.player.Options.RepeatingContext = *repeatingContext
+ 
+@@ -1104,27 +1179,29 @@ func (p *AppPlayer) setOptions(repeatingContext *bool, repeatingTrack *bool, shu
+ 
+ 	if p.state.tracks != nil && shufflingContext != nil && *shufflingContext != p.state.player.Options.ShufflingContext {
+ 		shuffle := *shufflingContext
++		list := p.state.tracks
++		gen := p.shuffleGen + 1
+ 
+-		// Reported straight away: this is what the shuffle button binds to, and
+-		// reordering the context can take a walk of every page. Reverted below
+-		// if that walk fails.
+-		p.state.player.Options.ShufflingContext = shuffle
+-		p.app.server.Emit(&ApiEvent{
+-			Type: ApiEventTypeShuffleContext,
+-			Data: ApiEventDataShuffleContext{
+-				Value: shuffle,
+-			},
+-		})
+-
+-		p.listJob("shuffle context", classMutate, nil,
++		submissionErr = p.listJob("shuffle context", classMutate, nil,
+ 			func(ctx context.Context, list *tracks.List) error {
+ 				return list.ToggleShuffle(ctx, shuffle)
+ 			},
+ 			func(p *AppPlayer, snap *tracks.Snapshot, err error) {
++				// A completed old list mutation must never change the options
++				// of a new context (in particular a DJ session).
++				if p.state.tracks != list {
++					return
++				}
+ 				if err != nil {
+ 					p.app.log.WithError(err).Errorf("failed toggling shuffle context (value: %t)", shuffle)
+-					p.state.player.Options.ShufflingContext = !shuffle
+-					p.updateState()
++					if gen == p.shuffleGen {
++						p.state.player.Options.ShufflingContext = !shuffle
++						p.app.server.Emit(&ApiEvent{
++							Type: ApiEventTypeShuffleContext,
++							Data: ApiEventDataShuffleContext{Value: !shuffle},
++						})
++						p.updateState()
++					}
+ 					return
+ 				}
+ 
+@@ -1134,7 +1211,17 @@ func (p *AppPlayer) setOptions(repeatingContext *bool, repeatingTrack *bool, shu
+ 				p.updateState()
+ 			})
+ 
+-		requiresUpdate = true
++		if submissionErr == nil {
++			// Report accepted work straight away: reordering can walk every
++			// page. A full or closed loader must not advertise a dropped toggle.
++			p.shuffleGen = gen
++			p.state.player.Options.ShufflingContext = shuffle
++			p.app.server.Emit(&ApiEvent{
++				Type: ApiEventTypeShuffleContext,
++				Data: ApiEventDataShuffleContext{Value: shuffle},
++			})
++			requiresUpdate = true
++		}
+ 	}
+ 
+ 	if requiresUpdate {
+@@ -1145,6 +1232,7 @@ func (p *AppPlayer) setOptions(repeatingContext *bool, repeatingTrack *bool, shu
+ 
+ 		p.updateState()
+ 	}
++	return submissionErr
+ }
+ 
+ func (p *AppPlayer) addToQueue(track *connectpb.ContextTrack) {
+@@ -1208,7 +1296,32 @@ func (p *AppPlayer) setQueue(prev []*connectpb.ContextTrack, next []*connectpb.C
  }
  
  func (p *AppPlayer) play() error {
@@ -1241,7 +1381,7 @@ index 27f3dd1..0d592aa 100644
  		// Asked for during a load: record it so the track starts playing when
  		// it lands, rather than losing the command.
  		if p.loadInFlight {
-@@ -1237,6 +1336,7 @@ func (p *AppPlayer) play() error {
+@@ -1237,6 +1350,7 @@ func (p *AppPlayer) play() error {
  	p.state.player.Timestamp = time.Now().UnixMilli()
  	p.state.player.PositionAsOfTimestamp = streamPos
  	p.state.setPaused(false)
@@ -1249,7 +1389,7 @@ index 27f3dd1..0d592aa 100644
  	p.updateState()
  	p.schedulePrefetchNext()
  
-@@ -1337,6 +1437,14 @@ func (p *AppPlayer) noteSkip() time.Duration {
+@@ -1337,6 +1451,14 @@ func (p *AppPlayer) noteSkip() time.Duration {
  }
  
  func (p *AppPlayer) skipPrev(allowSeeking bool) error {
@@ -1264,7 +1404,7 @@ index 27f3dd1..0d592aa 100644
  	// The position read here belongs to the stream on its way out while a load
  	// is outstanding: a second press means the track before it, not a restart.
  	if allowSeeking && !p.loadInFlight && p.player.PositionMs() > 3000 {
-@@ -1379,6 +1487,14 @@ func (p *AppPlayer) skipPrev(allowSeeking bool) error {
+@@ -1379,6 +1501,14 @@ func (p *AppPlayer) skipPrev(allowSeeking bool) error {
  }
  
  func (p *AppPlayer) skipNext(track *connectpb.ContextTrack) error {
@@ -1279,7 +1419,7 @@ index 27f3dd1..0d592aa 100644
  	p.sess.Events().OnPlayerSkipForward(p.primaryStream, p.player.PositionMs(), track != nil)
  
  	delay := p.noteSkip()
-@@ -1440,7 +1556,7 @@ func (p *AppPlayer) skipNext(track *connectpb.ContextTrack) error {
+@@ -1440,7 +1570,7 @@ func (p *AppPlayer) skipNext(track *connectpb.ContextTrack) error {
  	return nil
  }
  
@@ -1288,7 +1428,7 @@ index 27f3dd1..0d592aa 100644
  // past in a row before stopping, so a fully-gated context can't loop forever.
  const maxConsecutiveUnplayableSkips = 50
  
-@@ -1449,6 +1565,11 @@ const maxConsecutiveUnplayableSkips = 50
+@@ -1449,6 +1579,11 @@ const maxConsecutiveUnplayableSkips = 50
  // by maxConsecutiveUnplayableSkips so a fully gated context cannot loop forever.
  // delay holds back the load it ends in, see loadCurrentTrack.
  func (p *AppPlayer) advanceNext(forceNext, drop bool, delay time.Duration, then func(hasNextTrack bool, err error)) {
@@ -1300,7 +1440,7 @@ index 27f3dd1..0d592aa 100644
  	if p.state.tracks == nil {
  		p.advanceTo(false, nil, drop, delay, then)
  		return
-@@ -1519,11 +1640,7 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
+@@ -1519,11 +1654,7 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
  		p.state.player.IsBuffering = false
  	}
  
@@ -1313,7 +1453,7 @@ index 27f3dd1..0d592aa 100644
  	p.loadCurrentTrack(!hasNextTrack, drop, true, delay, func(err error) {
  		if err == nil {
  			p.consecutiveUnplayableSkips = 0
-@@ -1537,15 +1654,10 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
+@@ -1537,15 +1668,10 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
  			return
  		}
  
@@ -1331,7 +1471,7 @@ index 27f3dd1..0d592aa 100644
  		// the first playable track instead of freezing, and can never recurse forever.
  		p.consecutiveUnplayableSkips++
  		if p.consecutiveUnplayableSkips > maxConsecutiveUnplayableSkips {
-@@ -1665,6 +1777,10 @@ func (p *AppPlayer) volumeUpdated() {
+@@ -1665,6 +1791,10 @@ func (p *AppPlayer) volumeUpdated() {
  }
  
  func (p *AppPlayer) stopPlayback() {
@@ -1612,7 +1752,7 @@ index 0000000..ff905d3
 +}
 diff --git a/daemon/dj_context_test.go b/daemon/dj_context_test.go
 new file mode 100644
-index 0000000..a4c4d3d
+index 0000000..8ad12e0
 --- /dev/null
 +++ b/daemon/dj_context_test.go
 @@ -0,0 +1,132 @@
@@ -1742,11 +1882,11 @@ index 0000000..a4c4d3d
 +	p.playbackReadyCh = make(chan struct{})
 +	resp, err := p.handleApiRequest(ApiRequest{Type: ApiRequestTypeRoot})
 +	require.NoError(t, err)
-+	require.Equal(t, &ApiRoot{DirectDj: true, Library: true}, resp)
++	require.Equal(t, &ApiRoot{DirectDj: true, Library: true, LikedShuffle: true}, resp)
 +	close(p.playbackReadyCh)
 +	resp, err = p.handleApiRequest(ApiRequest{Type: ApiRequestTypeRoot})
 +	require.NoError(t, err)
-+	require.Equal(t, &ApiRoot{PlaybackReady: true, DirectDj: true, Library: true}, resp)
++	require.Equal(t, &ApiRoot{PlaybackReady: true, DirectDj: true, Library: true, LikedShuffle: true}, resp)
 +}
 diff --git a/daemon/dj_start_test.go b/daemon/dj_start_test.go
 new file mode 100644
@@ -2458,7 +2598,7 @@ index 0000000..79f544b
 +}
 diff --git a/daemon/library_api_test.go b/daemon/library_api_test.go
 new file mode 100644
-index 0000000..b08c4fc
+index 0000000..8365acd
 --- /dev/null
 +++ b/daemon/library_api_test.go
 @@ -0,0 +1,184 @@
@@ -2642,9 +2782,9 @@ index 0000000..b08c4fc
 +	raw, err := json.Marshal(page)
 +	require.NoError(t, err)
 +	require.JSONEq(t, `{"items":[],"offset":0,"limit":20,"total":0,"has_next":false}`, string(raw))
-+	raw, err = json.Marshal(ApiRoot{Library: true, DirectDj: true})
++	raw, err = json.Marshal(ApiRoot{Library: true, DirectDj: true, LikedShuffle: true})
 +	require.NoError(t, err)
-+	require.JSONEq(t, `{"library":true,"direct_dj":true,"playback_ready":false}`, string(raw))
++	require.JSONEq(t, `{"library":true,"direct_dj":true,"playback_ready":false,"liked_shuffle":true}`, string(raw))
 +}
 diff --git a/daemon/library_relink_test.go b/daemon/library_relink_test.go
 new file mode 100644
@@ -3096,8 +3236,298 @@ index 0000000..dff405e
 +		t.Fatalf("mutation cancellation lost: %v", err)
 +	}
 +}
+diff --git a/daemon/liked_shuffle.go b/daemon/liked_shuffle.go
+new file mode 100644
+index 0000000..12e3fbf
+--- /dev/null
++++ b/daemon/liked_shuffle.go
+@@ -0,0 +1,18 @@
++package daemon
++
++// setLikedShuffle runs on the player loop. Compare the intended account and
++// context here, together with the mutation, so a Spotify Connect transfer
++// between the client's status read and POST cannot shuffle a different context.
++func (p *AppPlayer) setLikedShuffle(data ApiShuffleContext, username string) error {
++	if username == "" || data.ContextUri == nil ||
++		*data.ContextUri != "spotify:user:"+username+":collection" ||
++		*data.ContextUri != p.state.player.ContextUri ||
++		p.state.tracks == nil || p.state.player.Track == nil ||
++		!p.state.player.IsPlaying || p.state.player.IsBuffering ||
++		p.playbackFailure != nil || p.playbackCooldownError() != nil ||
++		len(p.state.player.Restrictions.GetDisallowTogglingShuffleReasons()) != 0 ||
++		len(p.state.player.ContextRestrictions.GetDisallowTogglingShuffleReasons()) != 0 {
++		return ErrShuffleConflict
++	}
++	return p.setOptions(nil, nil, &data.ShuffleContext)
++}
+diff --git a/daemon/liked_shuffle_test.go b/daemon/liked_shuffle_test.go
+new file mode 100644
+index 0000000..7f3426a
+--- /dev/null
++++ b/daemon/liked_shuffle_test.go
+@@ -0,0 +1,260 @@
++//go:build test_unit
++
++package daemon
++
++import (
++	"encoding/json"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++	"github.com/stretchr/testify/require"
++)
++
++const testLikedURI = "spotify:user:test-account:collection"
++
++func likedShufflePlayer(t *testing.T) *AppPlayer {
++	t.Helper()
++	p := recoveryPlayer(t)
++	ctx := &connectpb.Context{Uri: testLikedURI, Pages: []*connectpb.ContextPage{{
++		Tracks: []*connectpb.ContextTrack{{Uri: trackUri(1)}, {Uri: trackUri(2)}, {Uri: trackUri(3)}},
++	}}}
++	list, err := tracks.NewTrackListFromContext(t.Context(), p.app.log, nil, ctx)
++	require.NoError(t, err)
++	require.True(t, list.GoStart(t.Context()))
++	p.state.tracks = list
++	p.state.player.ContextUri = testLikedURI
++	p.state.player.IsPlaying = true
++	p.publishSnapshot(list.Snapshot(t.Context(), []*connectpb.ContextTrack{}))
++	return p
++}
++
++func likedShufflePayload(value bool) ApiShuffleContext {
++	uri := testLikedURI
++	return ApiShuffleContext{ContextUri: &uri, ShuffleContext: value}
++}
++
++func TestLikedShuffleKeepsCurrentSongAndSupportsOff(t *testing.T) {
++	p := likedShufflePlayer(t)
++	for _, value := range []bool{true, false} {
++		require.NoError(t, p.setLikedShuffle(likedShufflePayload(value), "test-account"))
++		require.Equal(t, value, p.state.player.Options.ShufflingContext)
++		runQueuedJob(t, p)
++		require.Equal(t, trackUri(1), p.state.player.Track.GetUri())
++		require.Equal(t, value, p.state.player.Options.ShufflingContext)
++	}
++}
++
++func TestLikedShuffleRejectsFullLoaderWithoutPublishingChange(t *testing.T) {
++	p := likedShufflePlayer(t)
++	for range loaderQueueSize {
++		p.loader.submit(idleJob("queued mutation", classMutate, noReply))
++	}
++	require.ErrorIs(t, p.setLikedShuffle(likedShufflePayload(true), "test-account"), ErrLoaderBusy)
++	require.False(t, p.state.player.Options.ShufflingContext)
++	require.NotContains(t, apiEvents(p), ApiEventTypeShuffleContext)
++	require.Len(t, p.loader.queue, loaderQueueSize)
++	require.Zero(t, p.shuffleGen)
++}
++
++func TestLikedShuffleRejectsClosedLoaderWithoutPublishingChange(t *testing.T) {
++	p := likedShufflePlayer(t)
++	p.loader.closed = true
++	require.ErrorIs(t, p.setLikedShuffle(likedShufflePayload(true), "test-account"), ErrNoSession)
++	require.False(t, p.state.player.Options.ShufflingContext)
++	require.NotContains(t, apiEvents(p), ApiEventTypeShuffleContext)
++	require.Empty(t, p.loader.queue)
++	require.Zero(t, p.shuffleGen)
++}
++
++func TestLikedShuffleLatestFailureStillRevertsAndNotifies(t *testing.T) {
++	p := likedShufflePlayer(t)
++	require.NoError(t, p.state.tracks.ToggleShuffle(t.Context(), true))
++	p.state.player.Options.ShufflingContext = true
++	require.NoError(t, p.setLikedShuffle(likedShufflePayload(false), "test-account"))
++	job := p.loader.queue[0]
++	p.loader.queue = nil
++	result := p.loader.execute(job, t.Context())
++	result.err = errors.New("failed re-fetching collection page")
++	p.applyLoaderResult(result)
++	require.True(t, p.state.player.Options.ShufflingContext)
++	events := p.app.server.(*recordingApiServer).emitted
++	require.Len(t, events, 2)
++	require.Equal(t, ApiEventTypeShuffleContext, events[1].Type)
++	require.True(t, events[1].Data.(ApiEventDataShuffleContext).Value)
++}
++
++func TestLikedShuffleOlderFailureCannotOverwriteLatestToggle(t *testing.T) {
++	p := likedShufflePlayer(t)
++	require.NoError(t, p.state.tracks.ToggleShuffle(t.Context(), true))
++	p.state.player.Options.ShufflingContext = true
++	for _, value := range []bool{false, true, false} {
++		require.NoError(t, p.setLikedShuffle(likedShufflePayload(value), "test-account"))
++	}
++	require.Len(t, p.loader.queue, 3)
++	jobs := p.loader.queue
++	p.loader.queue = nil
++	for i, job := range jobs {
++		result := p.loader.execute(job, t.Context())
++		if i == 0 {
++			// A failed unshuffle result arrives after the newer requests were
++			// already accepted, as with a transient page re-fetch failure.
++			result.err = errors.New("failed re-fetching collection page")
++		}
++		p.applyLoaderResult(result)
++		require.False(t, p.state.player.Options.ShufflingContext,
++			"an older result must preserve the latest accepted OFF intent")
++	}
++	require.Equal(t, trackUri(1), p.state.player.Track.GetUri())
++}
++
++func TestLikedShuffleRejectsChangedOrUnavailableContext(t *testing.T) {
++	for _, tc := range []struct {
++		name   string
++		change func(*AppPlayer, *ApiShuffleContext)
++	}{
++		{"DJ takeover", func(p *AppPlayer, _ *ApiShuffleContext) { p.state.player.ContextUri = djContextURI }},
++		{"another account collection", func(p *AppPlayer, d *ApiShuffleContext) {
++			uri := "spotify:user:other-account:collection"
++			p.state.player.ContextUri, d.ContextUri = uri, &uri
++		}},
++		{"non-collection context", func(p *AppPlayer, d *ApiShuffleContext) {
++			uri := djContextURI
++			p.state.player.ContextUri, d.ContextUri = uri, &uri
++		}},
++		{"missing context", func(_ *AppPlayer, d *ApiShuffleContext) { d.ContextUri = nil }},
++		{"empty context", func(_ *AppPlayer, d *ApiShuffleContext) { uri := ""; d.ContextUri = &uri }},
++		{"resolving", func(p *AppPlayer, _ *ApiShuffleContext) { p.state.tracks = nil }},
++		{"missing current track", func(p *AppPlayer, _ *ApiShuffleContext) { p.state.player.Track = nil }},
++		{"buffering", func(p *AppPlayer, _ *ApiShuffleContext) { p.state.player.IsBuffering = true }},
++		{"stopped", func(p *AppPlayer, _ *ApiShuffleContext) { p.state.player.IsPlaying = false }},
++		{"playback error", func(p *AppPlayer, _ *ApiShuffleContext) {
++			p.playbackFailure = &ApiPlaybackError{Kind: "audio_key_refused"}
++		}},
++		{"audio cooldown", func(p *AppPlayer, _ *ApiShuffleContext) { p.loader.refuseAudioKey() }},
++		{"track restrictions", func(p *AppPlayer, _ *ApiShuffleContext) {
++			p.state.player.Restrictions = &connectpb.Restrictions{DisallowTogglingShuffleReasons: []string{"dj"}}
++		}},
++		{"context restrictions", func(p *AppPlayer, _ *ApiShuffleContext) {
++			p.state.player.ContextRestrictions = &connectpb.Restrictions{DisallowTogglingShuffleReasons: []string{"dj"}}
++		}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			p := likedShufflePlayer(t)
++			data := likedShufflePayload(true)
++			tc.change(p, &data)
++			require.ErrorIs(t, p.setLikedShuffle(data, "test-account"), ErrShuffleConflict)
++			require.False(t, p.state.player.Options.ShufflingContext)
++			require.Empty(t, p.loader.queue)
++			require.Empty(t, apiEvents(p))
++		})
++	}
++	p := likedShufflePlayer(t)
++	require.ErrorIs(t, p.setLikedShuffle(likedShufflePayload(true), "new-account"), ErrShuffleConflict)
++	require.ErrorIs(t, p.setLikedShuffle(likedShufflePayload(true), ""), ErrShuffleConflict)
++}
++
++func TestLikedShuffleLateCompletionCannotChangeDJOptions(t *testing.T) {
++	p := likedShufflePlayer(t)
++	p.state.player.Options.ShufflingContext = true
++	require.NoError(t, p.setLikedShuffle(likedShufflePayload(false), "test-account"))
++	require.Len(t, p.loader.queue, 1)
++	job := p.loader.queue[0]
++	p.loader.queue = nil
++	result := p.loader.execute(job, t.Context())
++	// Connect transfers to DJ before the old list mutation is committed.
++	p.state.tracks = recoveryPlayer(t).state.tracks
++	p.state.player.ContextUri = djContextURI
++	p.state.player.Options.ShufflingContext = false
++	p.applyLoaderResult(result)
++	require.False(t, p.state.player.Options.ShufflingContext)
++	require.Equal(t, djContextURI, p.state.player.ContextUri)
++}
++
++func TestLikedShuffleHTTPChecksContextAfterStatusRead(t *testing.T) {
++	p := likedShufflePlayer(t)
++	s := &ConcreteApiServer{log: &librespot.NullLogger{}, requests: make(chan ApiRequest, 1)}
++	done := make(chan struct{})
++	defer close(done)
++	go func() {
++		for {
++			select {
++			case req := <-s.requests:
++				switch req.Type {
++				case ApiRequestTypeStatus:
++					uri := p.state.player.ContextUri
++					req.Reply(&ApiStatus{Username: "test-account", ContextUri: &uri}, nil)
++				case ApiRequestTypeSetLikedShuffle:
++					req.Reply(nil, p.setLikedShuffle(req.Data.(ApiShuffleContext), "test-account"))
++				default:
++					req.Reply(nil, ErrBadRequest)
++				}
++			case <-done:
++				return
++			}
++		}
++	}()
++	statusResponse := httptest.NewRecorder()
++	s.handler().ServeHTTP(statusResponse, httptest.NewRequest(http.MethodGet, "/status", nil))
++	require.Equal(t, http.StatusOK, statusResponse.Code)
++	var status ApiStatus
++	require.NoError(t, json.Unmarshal(statusResponse.Body.Bytes(), &status))
++	require.Equal(t, testLikedURI, *status.ContextUri)
++	// A previously valid status must not authorize a toggle after takeover.
++	p.state.player.ContextUri = djContextURI
++	request := httptest.NewRequest(http.MethodPost, "/player/shuffle_context", strings.NewReader(`{"context_uri":"`+*status.ContextUri+`","shuffle_context":true}`))
++	request.Header.Set("Content-Type", "application/json")
++	response := httptest.NewRecorder()
++	s.handler().ServeHTTP(response, request)
++	require.Equal(t, http.StatusConflict, response.Code)
++	require.False(t, p.state.player.Options.ShufflingContext)
++	require.Empty(t, p.loader.queue)
++}
++
++func TestLikedShuffleHTTPRejectsFullLoader(t *testing.T) {
++	p := likedShufflePlayer(t)
++	for range loaderQueueSize {
++		p.loader.submit(idleJob("queued mutation", classMutate, noReply))
++	}
++	s := &ConcreteApiServer{log: &librespot.NullLogger{}, requests: make(chan ApiRequest, 1)}
++	go func() {
++		req := <-s.requests
++		req.Reply(nil, p.setLikedShuffle(req.Data.(ApiShuffleContext), "test-account"))
++	}()
++	request := httptest.NewRequest(http.MethodPost, "/player/shuffle_context", strings.NewReader(`{"context_uri":"`+testLikedURI+`","shuffle_context":true}`))
++	request.Header.Set("Content-Type", "application/json")
++	response := httptest.NewRecorder()
++	s.handler().ServeHTTP(response, request)
++	require.Equal(t, http.StatusConflict, response.Code)
++	require.False(t, p.state.player.Options.ShufflingContext)
++	require.NotContains(t, apiEvents(p), ApiEventTypeShuffleContext)
++}
++
++func TestLikedShuffleRoutePreservesLegacyToggle(t *testing.T) {
++	for _, tc := range []struct {
++		body string
++		kind ApiRequestType
++	}{
++		{`{"shuffle_context":false}`, ApiRequestTypeSetShufflingContext},
++		{`{"context_uri":"` + testLikedURI + `","shuffle_context":false}`, ApiRequestTypeSetLikedShuffle},
++	} {
++		s := &ConcreteApiServer{log: &librespot.NullLogger{}, requests: make(chan ApiRequest, 1)}
++		received := make(chan ApiRequest, 1)
++		go func() { req := <-s.requests; received <- req; req.Reply(nil, nil) }()
++		response := httptest.NewRecorder()
++		s.handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/player/shuffle_context", strings.NewReader(tc.body)))
++		require.Equal(t, http.StatusOK, response.Code)
++		req := <-received
++		require.Equal(t, tc.kind, req.Type)
++		if tc.kind == ApiRequestTypeSetLikedShuffle {
++			require.Equal(t, likedShufflePayload(false), req.Data)
++		} else {
++			require.Equal(t, false, req.Data)
++		}
++	}
++}
 diff --git a/daemon/loader.go b/daemon/loader.go
-index ec0641d..ba8397b 100644
+index ec0641d..be5c2b3 100644
 --- a/daemon/loader.go
 +++ b/daemon/loader.go
 @@ -47,6 +47,29 @@ func (r replyTo) done(data any, err error) {
@@ -3130,6 +3560,24 @@ index ec0641d..ba8397b 100644
  	if res.class == classLoad && res.gen == p.loadGen {
  		p.loadInFlight = false
  
+@@ -100,14 +123,14 @@ var ErrNoContext = errors.New("no context")
+ func (p *AppPlayer) listJob(name string, class loaderClass, nextHint []*connectpb.ContextTrack,
+ 	walk func(ctx context.Context, list *tracks.List) error,
+ 	commit func(p *AppPlayer, snap *tracks.Snapshot, err error),
+-) {
++) error {
+ 	list := p.state.tracks
+ 	if list == nil {
+ 		commit(p, nil, ErrNoContext)
+-		return
++		return ErrNoContext
+ 	}
+ 
+-	p.loader.submit(loaderJob{
++	return p.loader.submit(loaderJob{
+ 		name:  name,
+ 		class: class,
+ 		gen:   p.generation(class),
 @@ -277,10 +300,11 @@ type loaderResult struct {
  	class loaderClass
  	reply replyTo
@@ -3162,20 +3610,60 @@ index ec0641d..ba8397b 100644
  
  	wake    chan struct{}
  	results chan loaderResult
-@@ -334,6 +359,12 @@ func (l *loaderLane) submit(job loaderJob) {
- 		return
- 	}
+@@ -323,15 +348,23 @@ func newLoaderLane(log librespot.Logger) *loaderLane {
+ }
  
+ // submit queues a job, dropping or cancelling whatever the new one supersedes.
+-// Never blocks: it is called from the player loop.
+-func (l *loaderLane) submit(job loaderJob) {
++// Never blocks: it is called from the player loop. Rejected submissions return
++// the error as well as answering job.reply, so callers without a reply can avoid
++// publishing work that was never accepted. Unneeded prefetches still return nil.
++func (l *loaderLane) submit(job loaderJob) error {
+ 	var dropped []loaderJob
+ 
+ 	l.mu.Lock()
+ 	if l.closed {
+ 		l.mu.Unlock()
+ 		job.reply.done(nil, ErrNoSession)
+-		return
++		return ErrNoSession
++	}
++
 +	if job.class != classMutate && time.Now().Before(l.audioKeyRetryAt) {
 +		l.mu.Unlock()
 +		job.reply.done(nil, errPlaybackCooldown)
-+		return
-+	}
-+
++		return errPlaybackCooldown
+ 	}
+ 
  	switch job.class {
- 	case classLoad, classNav:
- 		dropped = l.dropLoadsLocked()
-@@ -490,7 +521,15 @@ func (l *loaderLane) execute(job loaderJob, ctx context.Context) loaderResult {
+@@ -341,7 +374,7 @@ func (l *loaderLane) submit(job loaderJob) {
+ 		if l.hasPendingLoad() {
+ 			l.mu.Unlock()
+ 			job.reply.done(nil, nil)
+-			return
++			return nil
+ 		}
+ 		dropped, l.queue = partitionQueue(l.queue, func(q loaderJob) bool {
+ 			return q.class == classPrefetch
+@@ -356,7 +389,7 @@ func (l *loaderLane) submit(job loaderJob) {
+ 		l.log.Warnf("dropping %s: the loader is too far behind", job.name)
+ 		job.reply.done(nil, ErrLoaderBusy)
+ 		replyAll(dropped, ErrSuperseded)
+-		return
++		return ErrLoaderBusy
+ 	}
+ 
+ 	l.queue = append(l.queue, job)
+@@ -368,6 +401,7 @@ func (l *loaderLane) submit(job loaderJob) {
+ 	case l.wake <- struct{}{}:
+ 	default:
+ 	}
++	return nil
+ }
+ 
+ // dropLoadsLocked cancels the load or prefetch in flight and removes those
+@@ -490,7 +524,15 @@ func (l *loaderLane) execute(job loaderJob, ctx context.Context) loaderResult {
  		l.mu.Unlock()
  	}()
  
@@ -4084,7 +4572,7 @@ index 0000000..32eb4f9
 +	require.Equal(t, "load "+queuedUri, p.loader.queue[0].name)
 +}
 diff --git a/daemon/player.go b/daemon/player.go
-index 6d62bc1..22279e1 100644
+index 6d62bc1..d7b39a2 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
 @@ -54,13 +54,28 @@ type AppPlayer struct {
@@ -4117,7 +4605,18 @@ index 6d62bc1..22279e1 100644
  	// loadGen stamps track and context work, prefetchGen what is fetched ahead
  	// for the transition after it. They are separate because a queue edit or
  	// an option change makes whatever was prefetched wrong without making the
-@@ -105,6 +120,10 @@ type AppPlayer struct {
+@@ -68,6 +83,10 @@ type AppPlayer struct {
+ 	loadGen     uint64
+ 	prefetchGen uint64
+ 
++	// shuffleGen orders accepted option changes independently of navigation.
++	// An earlier mutation failure must not revert a newer shuffle request.
++	shuffleGen uint64
++
+ 	// loadInFlight is set while a track load is outstanding. The player is
+ 	// handed its new stream from the loader lane, so the event announcing
+ 	// playback can reach the loop before the load has been recorded; holding
+@@ -105,6 +124,10 @@ type AppPlayer struct {
  	primaryStream   *player.Stream
  	secondaryStream *player.Stream
  
@@ -4128,7 +4627,7 @@ index 6d62bc1..22279e1 100644
  	// secondarySource is what the player was handed as the secondary.
  	secondarySource librespot.AudioSource
  
-@@ -148,7 +167,7 @@ type AppPlayer struct {
+@@ -148,7 +171,7 @@ type AppPlayer struct {
  	sleepAtEndOfTrack bool
  
  	// consecutiveUnplayableSkips bounds how many unplayable tracks in a row advanceNext will
@@ -4137,7 +4636,7 @@ index 6d62bc1..22279e1 100644
  	// of refused tracks (even at the very start of a context) advances to the first playable
  	// one instead of freezing, and can never loop forever. Reset to 0 on any successful load.
  	consecutiveUnplayableSkips int
-@@ -321,6 +340,7 @@ func (p *AppPlayer) trackListFromContext(ctx context.Context, spotCtx *connectpb
+@@ -321,6 +344,7 @@ func (p *AppPlayer) trackListFromContext(ctx context.Context, spotCtx *connectpb
  // hands over: its id, options, origin and context. The tracks and the playback
  // are the caller's.
  func (p *AppPlayer) applyTransferSession(transferState *connectpb.TransferState, sentBy string) {
@@ -4145,7 +4644,7 @@ index 6d62bc1..22279e1 100644
  	if sessId := transferState.CurrentSession.OriginalSessionId; sessId != nil {
  		p.state.player.SessionId = *sessId
  	} else {
-@@ -357,7 +377,11 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
+@@ -357,7 +381,11 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
  
  	current := transferState.Playback.CurrentTrack
  	named := singleTrackContext(current)
@@ -4158,7 +4657,7 @@ index 6d62bc1..22279e1 100644
  		return false
  	}
  
-@@ -369,6 +393,13 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
+@@ -369,6 +397,13 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
  }
  
  func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
@@ -4172,7 +4671,7 @@ index 6d62bc1..22279e1 100644
  	p.state.lastCommand = &req
  
  	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
-@@ -647,9 +678,16 @@ func nonEmpty(s string) *string {
+@@ -647,9 +682,16 @@ func nonEmpty(s string) *string {
  }
  
  func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
@@ -4186,11 +4685,11 @@ index 6d62bc1..22279e1 100644
  	switch req.Type {
  	case ApiRequestTypeRoot:
 -		return &ApiRoot{PlaybackReady: p.playbackReady()}, nil
-+		return &ApiRoot{PlaybackReady: p.playbackReady(), DirectDj: true, Library: true}, nil
++		return &ApiRoot{PlaybackReady: p.playbackReady(), DirectDj: true, Library: true, LikedShuffle: true}, nil
  	case ApiRequestTypeStatus:
  		resp := &ApiStatus{
  			Username:           p.sess.Username(),
-@@ -664,6 +702,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -664,6 +706,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  			Stopped:            !p.state.player.IsPlaying,
  			Paused:             p.state.player.IsPaused,
  			Buffering:          p.state.player.IsBuffering,
@@ -4198,7 +4697,7 @@ index 6d62bc1..22279e1 100644
  			PlayOrigin:         nonEmpty(p.state.player.PlayOrigin.FeatureIdentifier),
  			PlayOriginDeviceId: nonEmpty(p.state.player.PlayOrigin.DeviceIdentifier),
  			ContextUri:         nonEmpty(p.state.player.ContextUri),
-@@ -677,6 +716,8 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -677,6 +720,8 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  		resp.NextTrack = p.apiNextTrack()
  
  		return resp, nil
@@ -4207,7 +4706,7 @@ index 6d62bc1..22279e1 100644
  	case ApiRequestTypeContextTracks:
  		if p.meta == nil {
  			return nil, ErrNotFound
-@@ -735,6 +776,12 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -735,6 +780,12 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  		return nil, nil
  	case ApiRequestTypePlay:
  		data := req.Data.(ApiPlay)
@@ -4220,7 +4719,7 @@ index 6d62bc1..22279e1 100644
  
  		var skipTo skipToFunc
  		if len(data.SkipToUri) > 0 {
-@@ -767,7 +814,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -767,7 +818,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  			gen:   p.loadGen,
  			reply: apiReply(req),
  			run: func(ctx context.Context) loaderResult {
@@ -4229,7 +4728,7 @@ index 6d62bc1..22279e1 100644
  				if err != nil {
  					return loaderResult{err: fmt.Errorf("failed resolving context: %w", err)}
  				}
-@@ -804,6 +851,9 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -804,6 +855,9 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  							}
  						}
  					})
@@ -4239,6 +4738,18 @@ index 6d62bc1..22279e1 100644
  				}}
  			},
  		})
+@@ -836,6 +890,11 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 		val := req.Data.(bool)
+ 		p.setOptions(nil, &val, nil)
+ 		return nil, nil
++	case ApiRequestTypeSetLikedShuffle:
++		if p.sess == nil {
++			return nil, ErrNoSession
++		}
++		return nil, p.setLikedShuffle(req.Data.(ApiShuffleContext), p.sess.Username())
+ 	case ApiRequestTypeSetShufflingContext:
+ 		val := req.Data.(bool)
+ 		p.setOptions(nil, nil, &val)
 diff --git a/daemon/player_state.go b/daemon/player_state.go
 index 7de1519..34165c7 100644
 --- a/daemon/player_state.go

@@ -25,6 +25,19 @@ def library_state(**overrides):
     return state
 
 
+def initialized_worker():
+    status = playback_state()["status"]
+    responses = {"/auth/code": {},
+                 "/": {"playback_ready": True, "direct_dj": True, "liked_shuffle": True},
+                 "/status": status}
+    api = Mock()
+    api.request.side_effect = lambda path, *args, **kwargs: copy.deepcopy(responses[path])
+    worker = djamp.PlayerWorker(api, autoplay=False)
+    worker._poll()
+    api.reset_mock()
+    return worker
+
+
 class TestLibraryControls(unittest.TestCase):
     def run_keys(self, keys, *, state=None, saved=None, demo=False, browse=None, worker=None):
         window = Mock()
@@ -83,16 +96,17 @@ class TestLibraryControls(unittest.TestCase):
     def test_selection_plays_collection_at_selected_uri_and_returns_to_player(self):
         worker, library, rendered, _ = self.run_keys(["L", curses.KEY_DOWN, "\n"])
         library.browse.assert_called_once_with(0)
-        worker.command.assert_called_once_with("/player/play", {
-            "uri": "spotify:user:test-user:collection", "skip_to_uri": "spotify:track:" + str(1).zfill(22)})
+        worker.play_liked.assert_called_once_with("test-user", "spotify:track:" + str(1).zfill(22))
+        worker.command.assert_not_called()
         self.assertFalse(rendered[-1][0]["library_open"])
 
     def test_accepted_selection_with_real_worker_queues_song_and_returns_to_player(self):
-        worker = djamp.PlayerWorker(Mock(), autoplay=False)
-        worker.state.update(playback_state())
-        _, _, rendered, _ = self.run_keys(["L", "j", "\n"], worker=worker)
-        self.assertEqual(worker.commands.get_nowait(), ("/player/play", {
-            "uri": "spotify:user:test-user:collection", "skip_to_uri": "spotify:track:" + str(1).zfill(22)}))
+        worker = initialized_worker()
+        with patch.object(worker, "play_liked", wraps=worker.play_liked) as play_liked:
+            _, _, rendered, _ = self.run_keys(["L", "j", "\n"], worker=worker)
+        play_liked.assert_called_once_with("test-user", "spotify:track:" + str(1).zfill(22))
+        self.assertEqual(worker.commands.qsize(), 1)
+        worker.commands.get_nowait()
         self.assertTrue(worker.commands.empty())
         self.assertFalse(rendered[-1][0]["library_open"])
         self.assertEqual(rendered[-1][3], "Opening your liked song…")
@@ -102,8 +116,7 @@ class TestLibraryControls(unittest.TestCase):
         for reason in ("queue_full", "cooldown"):
             for key in ("\n", "d", "D", "o"):
                 with self.subTest(reason=reason, key=key), patch("djamp.time.monotonic", return_value=100):
-                    worker = djamp.PlayerWorker(Mock(), autoplay=False)
-                    worker.state.update(playback_state())
+                    worker = initialized_worker()
                     if reason == "queue_full":
                         for _ in range(worker.commands.maxsize):
                             self.assertTrue(worker.command("/player/volume", {"volume": 0}))
@@ -156,12 +169,71 @@ class TestLibraryControls(unittest.TestCase):
                 state.update(changes)
                 worker, _, rendered, _ = self.run_keys(["L", "\n"], state=state, saved=saved)
                 worker.command.assert_not_called()
+                worker.play_liked.assert_not_called()
                 self.assertTrue(rendered[-1][0]["library_open"])
                 self.assertTrue(rendered[-1][3])
         state = playback_state()
         state["status"].pop("username")
         worker, _, _, _ = self.run_keys(["L", "\n"], state=state)
         worker.command.assert_not_called()
+        worker.play_liked.assert_not_called()
+
+    def test_shuffle_in_library_targets_liked_preference_while_dj_is_playing(self):
+        state = playback_state()
+        state["status"]["context_uri"] = djamp.DJ_URI
+        worker, library, rendered, _ = self.run_keys(["L", "s"], state=state)
+        worker.shuffle_liked.assert_called_once_with("test-user")
+        worker.command.assert_not_called()
+        worker.play_liked.assert_not_called()
+        library.toggle.assert_not_called()
+        self.assertTrue(rendered[-1][0]["library_open"])
+
+    def test_shuffle_on_player_targets_only_own_liked_collection(self):
+        for context, allowed in (("spotify:user:test-user:collection", True),
+                                 ("spotify:user:another-user:collection", False),
+                                 (djamp.DJ_URI, False), ("", False)):
+            with self.subTest(context=context):
+                state = playback_state()
+                state["status"]["context_uri"] = context
+                worker, _, rendered, _ = self.run_keys(["s"], state=state)
+                worker.command.assert_not_called()
+                if allowed:
+                    worker.shuffle_liked.assert_called_once_with("test-user")
+                else:
+                    worker.shuffle_liked.assert_not_called()
+                    self.assertEqual(rendered[-1][3], "Open Liked Songs with L to choose shuffle.")
+
+    def test_shuffle_waits_for_authenticated_connected_player(self):
+        for changes in ({"connected": False}, {"ready": False}, {"username": None}):
+            with self.subTest(changes=changes):
+                state = playback_state()
+                if "username" in changes:
+                    state["status"].pop("username")
+                else:
+                    state.update(changes)
+                worker, _, rendered, _ = self.run_keys(["L", "s"], state=state)
+                worker.shuffle_liked.assert_not_called()
+                worker.command.assert_not_called()
+                self.assertTrue(rendered[-1][0]["library_open"])
+                self.assertTrue(rendered[-1][3])
+
+    def test_rejected_shuffle_keeps_library_selection_and_worker_feedback(self):
+        worker = Mock()
+        state = playback_state()
+        state["notice"] = "Player busy; command was not queued. Try again."
+        worker.snapshot.return_value = state
+        worker.shuffle_liked.return_value = False
+        saved = library_state()
+        saved["items"][0]["playable"] = False
+        _, _, rendered, _ = self.run_keys(["L", "\n", "j", "s"], saved=saved, worker=worker)
+        worker.shuffle_liked.assert_called_once_with("test-user")
+        self.assertTrue(rendered[-1][0]["library_open"])
+        self.assertEqual(rendered[-1][0]["library_selection"], 1)
+        self.assertEqual(rendered[-1][3], "")
+        window = Window(24, 58)
+        djamp.render(djamp.Canvas(window), *rendered[-1])
+        self.assertIn("Player busy; command was not queued.", window.text())
+        self.assertNotIn("This liked song is unavailable", window.text())
 
     def test_like_does_not_send_duplicate_or_non_track_requests(self):
         for uri, pending in ((PLAYING_URI, True), (None, False), ("spotify:episode:" + "1" * 22, False)):
@@ -198,6 +270,22 @@ class TestLibraryControls(unittest.TestCase):
         library.toggle.assert_not_called()
         popen.assert_not_called()
 
+    def test_demo_shuffle_is_local_and_available_after_liked_selection(self):
+        worker, library, rendered, popen = self.run_keys(["L", "s", "j", "\n", "s"], demo=True)
+        self.assertFalse(rendered[1][0].get("liked_shuffle", False))
+        self.assertTrue(rendered[2][0]["liked_shuffle"])
+        selected = rendered[4][0]
+        self.assertFalse(selected["library_open"])
+        self.assertTrue(selected["liked_shuffle"])
+        self.assertEqual(selected["status"]["context_uri"],
+                         f"spotify:user:{selected['status']['username']}:collection")
+        self.assertFalse(rendered[5][0]["liked_shuffle"])
+        worker.command.assert_not_called()
+        worker.shuffle_liked.assert_not_called()
+        worker.play_liked.assert_not_called()
+        library.observe.assert_not_called()
+        popen.assert_not_called()
+
     def test_demo_main_does_not_construct_any_live_services(self):
         with ExitStack() as stack:
             stack.enter_context(patch("djamp.sys.argv", ["djamp", "--demo"]))
@@ -214,6 +302,53 @@ class TestLibraryControls(unittest.TestCase):
 
 
 class TestLibraryRendering(unittest.TestCase):
+    def test_library_shuffle_state_and_pending_indicator_fit_narrow_heading(self):
+        audio = ([0.0] * 32, [0.0] * 128, "OUTPUT AUDIO")
+        for enabled in (False, True):
+            for pending in (False, True):
+                with self.subTest(enabled=enabled, pending=pending):
+                    state = playback_state()
+                    state.update(library=library_state(offset=999980, total=1000000),
+                                 library_open=True, library_selection=0,
+                                 liked_shuffle=enabled, liked_shuffle_pending=pending)
+                    window = Window(24, 58)
+                    djamp.render(djamp.Canvas(window), state, audio)
+                    heading = next(line for line in window.text().splitlines() if "LIKED SONGS" in line)
+                    self.assertIn("SHUFFLE ON" if enabled else "SHUFFLE OFF", heading)
+                    self.assertEqual("…" in heading, pending)
+                    self.assertIn("s shuffle", window.text())
+
+    def test_player_shuffle_indicator_is_visible_despite_temporary_notices(self):
+        audio = ([0.0] * 32, [0.0] * 128, "OUTPUT AUDIO")
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                state = playback_state()
+                state["status"]["context_uri"] = "spotify:user:test-user:collection"
+                state.update(liked_shuffle=enabled, liked_shuffle_pending=False)
+                window = Window(24, 58)
+                djamp.render(djamp.Canvas(window), state, audio, notice="Volume changed")
+                self.assertIn("LIKED · SHUFFLE ON" if enabled else "LIKED · SHUFFLE OFF", window.text())
+                self.assertIn("Volume changed", window.text())
+
+    def test_player_does_not_show_liked_shuffle_indicator_for_dj_or_other_account(self):
+        audio = ([0.0] * 32, [0.0] * 128, "OUTPUT AUDIO")
+        for context in (djamp.DJ_URI, "spotify:user:another-user:collection"):
+            with self.subTest(context=context):
+                state = playback_state()
+                state["status"]["context_uri"] = context
+                state.update(liked_shuffle=True, liked_shuffle_pending=False)
+                window = Window(24, 58)
+                djamp.render(djamp.Canvas(window), state, audio)
+                self.assertNotIn("LIKED · SHUFFLE", window.text())
+
+    def test_shuffle_help_fits_minimum_terminal(self):
+        state = playback_state()
+        audio = ([0.0] * 32, [0.0] * 128, "OUTPUT AUDIO")
+        window = Window(24, 58)
+        djamp.render(djamp.Canvas(window), state, audio, show_help=True)
+        self.assertIn("shuffle", window.text().lower())
+        self.assertIn("Press ? or Esc to close", window.text())
+
     def test_relinked_song_badge_uses_original_uri(self):
         state = playback_state()
         alias = "spotify:track:" + "9" * 22

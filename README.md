@@ -3,7 +3,7 @@
 A compact, CLIamp-inspired terminal Spotify player. It starts Spotify DJ X
 directly, including narration, using your existing go-librespot login. It has a progress bar,
 volume, keyboard controls, output spectrum/waveform views, and recent tracks
-from the current session. You can like songs and browse and play your Liked
+from the current session. You can like songs and browse, play, and shuffle your Liked
 Songs collection. It is a custom front end, not a CLIamp plugin.
 
 ## Requirements
@@ -122,6 +122,7 @@ not install or change go-librespot, its credentials, or your audio service.
 | b | Open Spotify in the browser (fallback) |
 | l | Like/unlike the currently playing song |
 | L | Open/close Liked Songs |
+| s | Toggle shuffle in Liked Songs or while playing that collection |
 | Up / Down or j / k | Select a song in Liked Songs |
 | PgUp / PgDn or [ / ] | Previous/next library page |
 | Enter | Play the selected liked song |
@@ -149,6 +150,17 @@ in another Spotify app. The collection is cached in memory for up to a minute;
 **r** refreshes it and the playing song's like indicator immediately. Unavailable
 tracks cannot be played. If Spotify plays a regional substitute, likes still
 refer to the original song in your collection.
+
+Press **s** in Liked Songs to turn shuffle on or off. The heading shows the
+setting; an ellipsis means a playback change is pending. Your selected song
+plays first, then shuffle randomizes the following songs from the collection,
+including beyond the visible library page. While playing Liked Songs, **s** also
+works from the main player and keeps the current song playing.
+
+Changing this setting while browsing alongside DJ playback only chooses how
+your next liked-song selection will play. It leaves the DJ session alone.
+The choice is kept for the current run; an active Liked Songs session also
+reflects shuffle changes made in another Spotify controller.
 
 Library requests run separately from playback controls. Errors are shown in the
 interface; a failed save is never displayed as a successful like. The offline
@@ -225,5 +237,7 @@ and desktop audio require testing from a normal desktop terminal.
 Library tests cover pagination, unavailable songs, confirmed likes, regional
 substitutes, refreshed like status, account and track changes during requests,
 failed writes, demo isolation, and keyboard navigation at the minimum terminal size.
+Shuffle tests cover collection startup, pending changes, account/context switches,
+and keeping DJ playback separate from the Liked Songs preference.
 Recovery tests cover persistent playback errors, cooldown input, manual retry,
 queued control cancellation, duplicate DJ starts, and connection loss.
