@@ -26,11 +26,12 @@ def library_state(**overrides):
 
 
 class TestLibraryControls(unittest.TestCase):
-    def run_keys(self, keys, *, state=None, saved=None, demo=False, browse=None):
+    def run_keys(self, keys, *, state=None, saved=None, demo=False, browse=None, worker=None):
         window = Mock()
         window.get_wch.side_effect = [*keys, "q"]
-        worker = Mock()
-        worker.snapshot.return_value = state if state is not None else playback_state()
+        if worker is None:
+            worker = Mock()
+            worker.snapshot.return_value = state if state is not None else playback_state()
         library = Mock()
         saved = saved if saved is not None else library_state()
         library.snapshot.side_effect = lambda: copy.deepcopy(saved)
@@ -85,6 +86,55 @@ class TestLibraryControls(unittest.TestCase):
         worker.command.assert_called_once_with("/player/play", {
             "uri": "spotify:user:test-user:collection", "skip_to_uri": "spotify:track:" + str(1).zfill(22)})
         self.assertFalse(rendered[-1][0]["library_open"])
+
+    def test_accepted_selection_with_real_worker_queues_song_and_returns_to_player(self):
+        worker = djamp.PlayerWorker(Mock(), autoplay=False)
+        worker.state.update(playback_state())
+        _, _, rendered, _ = self.run_keys(["L", "j", "\n"], worker=worker)
+        self.assertEqual(worker.commands.get_nowait(), ("/player/play", {
+            "uri": "spotify:user:test-user:collection", "skip_to_uri": "spotify:track:" + str(1).zfill(22)}))
+        self.assertTrue(worker.commands.empty())
+        self.assertFalse(rendered[-1][0]["library_open"])
+        self.assertEqual(rendered[-1][3], "Opening your liked song…")
+        worker.api.request.assert_not_called()
+
+    def test_rejected_playback_keeps_library_selection_and_shows_worker_feedback(self):
+        for reason in ("queue_full", "cooldown"):
+            for key in ("\n", "d", "D", "o"):
+                with self.subTest(reason=reason, key=key), patch("djamp.time.monotonic", return_value=100):
+                    worker = djamp.PlayerWorker(Mock(), autoplay=False)
+                    worker.state.update(playback_state())
+                    if reason == "queue_full":
+                        for _ in range(worker.commands.maxsize):
+                            self.assertTrue(worker.command("/player/volume", {"volume": 0}))
+                        expected_feedback = "Player busy; command was not queued."
+                    else:
+                        worker.state["status"].update(stopped=True, paused=True, playback_error={
+                            "kind": "audio_key_refused", "message": "Spotify refused the audio key.",
+                            "uri": PLAYING_URI, "retry_after_ms": 10000})
+                        expected_feedback = "Retry in 10s"
+                    queued_before = list(worker.commands.queue)
+                    saved = library_state()
+                    saved["items"][0]["playable"] = False
+                    with patch("djamp.prompt_link", return_value=PLAYING_URI):
+                        # First leave a transient notice, then select a playable song.
+                        _, _, rendered, _ = self.run_keys(["L", "\n", "j", key], saved=saved, worker=worker)
+                    frame = rendered[-1]
+                    self.assertTrue(frame[0]["library_open"])
+                    self.assertEqual(frame[0]["library_selection"], 1)
+                    self.assertEqual(list(worker.commands.queue), queued_before)
+                    self.assertEqual(frame[3], "")
+                    window = Window(24, 58)
+                    djamp.render(djamp.Canvas(window), *frame)
+                    screen = window.text()
+                    self.assertIn("LIKED SONGS", screen)
+                    self.assertIn(expected_feedback, screen)
+                    self.assertNotIn("Opening", screen)
+                    self.assertNotIn("This liked song is unavailable", screen)
+                    if reason == "cooldown":
+                        self.assertIn("FAILED", screen)
+                        self.assertIn("Spotify refused the audio key.", screen)
+                    worker.api.request.assert_not_called()
 
     def test_page_keys_and_refresh_use_the_displayed_offset(self):
         def browse(saved, offset):

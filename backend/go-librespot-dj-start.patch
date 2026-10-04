@@ -1,5 +1,5 @@
 diff --git a/api-spec.yml b/api-spec.yml
-index 662db9f..d1f580d 100644
+index 662db9f..317ad08 100644
 --- a/api-spec.yml
 +++ b/api-spec.yml
 @@ -37,8 +37,12 @@ components:
@@ -10,7 +10,7 @@ index 662db9f..d1f580d 100644
 +          description: URI of the playable track or episode, after any relinking
            type: string
 +        requested_uri:
-+          description: Original URI requested before relinking; use this identity for library operations
++          description: Selected URI before relinking, bound to the committed stream for the current track; use this identity for library operations
 +          type: string
 +          x-go-type-skip-optional-pointer: true
          name:
@@ -131,7 +131,7 @@ index 662db9f..d1f580d 100644
      volume:
        x-go-name: ApiVolume
        description: The player volume settings
-@@ -421,6 +511,78 @@ components:
+@@ -421,6 +511,82 @@ components:
            x-go-type-skip-optional-pointer: true
  
  paths:
@@ -191,7 +191,7 @@ index 662db9f..d1f580d 100644
 +  /library/save:
 +    post:
 +      operationId: saveLibraryTrack
-+      description: Sets one track's saved state for the expected account; confirms only after Spotify accepts the update
++      description: Sets one track's saved state for the expected account; confirms only after Spotify accepts the update. Requires application/json. Browser Origin headers must identify an HTTP(S) origin permitted by server.allow_origin; native clients may omit Origin.
 +      requestBody:
 +        required: true
 +        content:
@@ -207,6 +207,10 @@ index 662db9f..d1f580d 100644
 +                $ref: '#/components/schemas/librarySaved'
 +        409:
 +          description: The authenticated account changed
++        403:
++          description: Browser origin is not permitted to mutate the library
++        415:
++          description: Content-Type must be application/json
    /:
      get:
        operationId: getRoot
@@ -256,7 +260,7 @@ index 343a799..11b63bc 100644
 +	require.Len(t, entries, 1, "atomic saves should leave no temporary files")
 +}
 diff --git a/daemon/api_gen.go b/daemon/api_gen.go
-index 4be8c8d..26404ac 100644
+index 4be8c8d..e2ef0ae 100644
 --- a/daemon/api_gen.go
 +++ b/daemon/api_gen.go
 @@ -66,6 +66,43 @@ type ApiDeviceAuth struct {
@@ -352,7 +356,7 @@ index 4be8c8d..26404ac 100644
  	// ReleaseDate Album release date, empty for episodes
  	ReleaseDate string `json:"release_date"`
  
-+	// RequestedUri Original URI requested before relinking; use this identity for library operations
++	// RequestedUri Selected URI before relinking, bound to the committed stream for the current track; use this identity for library operations
 +	RequestedUri string `json:"requested_uri,omitempty"`
 +
  	// SampleRate Sample rate of the decoded audio in Hz
@@ -539,10 +543,10 @@ index 4be8c8d..26404ac 100644
  	m.HandleFunc("POST "+options.BaseURL+"/player/output", wrapper.PlayerOutput)
 diff --git a/daemon/api_requested_uri_test.go b/daemon/api_requested_uri_test.go
 new file mode 100644
-index 0000000..89a2966
+index 0000000..624ce68
 --- /dev/null
 +++ b/daemon/api_requested_uri_test.go
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,140 @@
 +//go:build test_unit
 +
 +package daemon
@@ -552,6 +556,7 @@ index 0000000..89a2966
 +	"testing"
 +
 +	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/dealer"
 +	"github.com/devgianlu/go-librespot/player"
 +	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 +	"github.com/stretchr/testify/require"
@@ -616,11 +621,88 @@ index 0000000..89a2966
 +	require.Equal(t, alternative, listing.Tracks[0].Track.Uri)
 +	require.Equal(t, original, listing.Tracks[0].Track.RequestedUri)
 +}
++
++func TestApiLibraryIdentityFollowsCommittedPrefetchSelection(t *testing.T) {
++	original := librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, gid(1))
++	alternative := librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, gid(2))
++	for _, selected := range []librespot.SpotifyId{original, alternative} {
++		t.Run(selected.Uri(), func(t *testing.T) {
++			p := recoveryPlayer(t)
++			stream := &player.Stream{RequestedId: original, Media: librespot.NewMediaFromTrack(metaTrack(alternative.Id(), "Relinked song"))}
++			p.secondaryStream = stream
++			p.state.player.Track = provided(selected.Uri())
++			p.loadCurrentTrack(true, true, false, 0, func(error) {})
++			require.Nil(t, p.secondaryStream, "both the original and its playable alternative reuse this prefetch")
++			require.Len(t, p.loader.queue, 1)
++
++			// The successful audio handoff returns this same prefetched stream.
++			// Commit it as production does without changing its RequestedId,
++			// which can still be read by the loader's event reporting.
++			p.loader.queue = nil
++			p.commitLoad(stream, selected.Uri(), true, 0, true)
++			require.Same(t, stream, p.primaryStream)
++			require.Equal(t, original, stream.RequestedId)
++			require.Equal(t, alternative.Uri(), p.newApiResponseStatusTrack(stream, 0).Uri)
++			require.Equal(t, selected.Uri(), p.newApiResponseStatusTrack(stream, 0).RequestedUri)
++
++			var metadata *ApiEventDataMetadata
++			for _, event := range p.app.server.(*recordingApiServer).emitted {
++				if event.Type == ApiEventTypeMetadata {
++					data := event.Data.(ApiEventDataMetadata)
++					metadata = &data
++				}
++			}
++			require.NotNil(t, metadata, "successful commit publishes the selected library identity")
++			require.Equal(t, alternative.Uri(), metadata.Uri)
++			require.Equal(t, selected.Uri(), metadata.RequestedUri)
++
++			// A retained transfer can reuse only the selection committed with
++			// the primary. The stream's original prefetch request is not enough.
++			p.state.setActive(true)
++			req := dealer.RequestPayload{}
++			req.Command.Options.RetainSession = "retain_original"
++			for _, incoming := range []librespot.SpotifyId{original, alternative} {
++				transfer := &connectpb.TransferState{Playback: &connectpb.Playback{CurrentTrack: &connectpb.ContextTrack{Uri: incoming.Uri()}}}
++				require.Equal(t, incoming.Uri() == selected.Uri(), p.transferContinues(req, transfer), "retained transfer for %s", incoming.Uri())
++			}
++
++			// A transfer claims a new selection before resolving its context.
++			// Even when that selection matches the outgoing relinked media,
++			// /status must still identify the committed outgoing selection.
++			for _, pendingURI := range []string{alternative.Uri(), trackUri(9)} {
++				p.state.player.Track = provided(pendingURI)
++				p.state.player.IsBuffering = true
++				statusTrack := p.newApiResponseStatusTrack(p.primaryStream, p.state.trackPosition())
++				require.Equal(t, selected.Uri(), statusTrack.RequestedUri, "pending claim of %s must not change library identity", pendingURI)
++			}
++
++			// Looking up an unrelated stream must not borrow the primary's
++			// selection, and the next successful handoff replaces it.
++			nextID := librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, gid(3))
++			next := &player.Stream{RequestedId: nextID, Media: librespot.NewMediaFromTrack(metaTrack(nextID.Id(), "Next song"))}
++			require.Equal(t, nextID.Uri(), p.newApiResponseStatusTrack(next, 0).RequestedUri)
++			p.state.player.Track = provided(nextID.Uri())
++			p.commitLoad(next, nextID.Uri(), true, 0, false)
++			require.Equal(t, nextID.Uri(), p.newApiResponseStatusTrack(next, 0).RequestedUri)
++		})
++	}
++}
 diff --git a/daemon/api_server.go b/daemon/api_server.go
-index 02bf0b2..4a70dd6 100644
+index 02bf0b2..f34d5af 100644
 --- a/daemon/api_server.go
 +++ b/daemon/api_server.go
-@@ -97,6 +97,7 @@ func (c *wsClient) send(log librespot.Logger, ev *ApiEvent) bool {
+@@ -6,8 +6,10 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"mime"
+ 	"net"
+ 	"net/http"
++	"net/url"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -97,6 +99,7 @@ func (c *wsClient) send(log librespot.Logger, ev *ApiEvent) bool {
  }
  
  var (
@@ -628,7 +710,7 @@ index 02bf0b2..4a70dd6 100644
  	ErrNoSession        = errors.New("no session")
  	ErrBadRequest       = errors.New("bad request")
  	ErrForbidden        = errors.New("forbidden")
-@@ -128,6 +129,9 @@ const (
+@@ -128,6 +131,9 @@ const (
  	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
  	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
  	ApiRequestTypeContextTracks       ApiRequestType = "context_tracks"
@@ -638,7 +720,7 @@ index 02bf0b2..4a70dd6 100644
  )
  
  // ApiRequestDataContextTracks carries the uri query parameter of the context
-@@ -234,6 +238,10 @@ func (p *AppPlayer) newApiResponseStatusTrack(stream *player.Stream, position in
+@@ -234,6 +240,16 @@ func (p *AppPlayer) newApiResponseStatusTrack(stream *player.Stream, position in
  	media := stream.Media
  
  	resp := p.newApiResponseStatusMedia(media, position)
@@ -646,10 +728,16 @@ index 02bf0b2..4a70dd6 100644
 +	if len(stream.RequestedId.Id()) == 16 {
 +		resp.RequestedUri = stream.RequestedId.Uri()
 +	}
++	// A prefetched A-to-B relink may also satisfy an explicit selection of
++	// B. Use the identity committed with this primary stream, rather than its
++	// original prefetch request or a new selection still waiting to load.
++	if stream == p.primaryStream && p.primaryRequestedURI != "" {
++		resp.RequestedUri = p.primaryRequestedURI
++	}
  
  	// The file is what actually got decoded, so report from it rather than from
  	// the requested bitrate: they differ whenever the preferred format was not
-@@ -434,7 +442,11 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
+@@ -434,7 +450,11 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
  		case errors.Is(resp.err, ErrTooManyRequests):
  			w.WriteHeader(http.StatusTooManyRequests)
  			return
@@ -662,7 +750,41 @@ index 02bf0b2..4a70dd6 100644
  			w.WriteHeader(http.StatusConflict)
  			return
  		case errors.Is(resp.err, ErrBadRequest):
-@@ -784,3 +796,28 @@ func (s *ConcreteApiServer) Close() error {
+@@ -706,21 +726,26 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
+-func (s *ConcreteApiServer) serve() {
+-	m := http.NewServeMux()
+-	handler := HandlerFromMux(s, m)
+-
+-	c := cors.New(cors.Options{
++func (s *ConcreteApiServer) cors() *cors.Cors {
++	return cors.New(cors.Options{
+ 		AllowedOrigins:      []string{s.allowOrigin},
+ 		AllowPrivateNetwork: true,
+ 		AllowCredentials:    true,
+ 	})
++}
++
++func (s *ConcreteApiServer) handler() http.Handler {
++	return s.cors().Handler(Handler(s))
++}
++
++func (s *ConcreteApiServer) serve() {
++	handler := s.handler()
+ 
+ 	var err error
+ 	if len(s.certFile) > 0 && len(s.keyFile) > 0 {
+-		err = http.ServeTLS(s.listener, c.Handler(handler), s.certFile, s.keyFile)
++		err = http.ServeTLS(s.listener, handler, s.certFile, s.keyFile)
+ 	} else {
+-		err = http.Serve(s.listener, c.Handler(handler))
++		err = http.Serve(s.listener, handler)
+ 	}
+ 
+ 	if s.close.Load() {
+@@ -784,3 +809,67 @@ func (s *ConcreteApiServer) Close() error {
  	_ = s.listener.Close()
  	return nil
  }
@@ -678,6 +800,23 @@ index 02bf0b2..4a70dd6 100644
 +	s.handleRequest(ApiRequest{Type: ApiRequestTypeLibraryContains, Data: params}, w)
 +}
 +func (s *ConcreteApiServer) SaveLibraryTrack(w http.ResponseWriter, r *http.Request) {
++	// Browser forms can send JSON disguised as text/plain without a CORS
++	// preflight. CORS alone only hides the response; it does not stop writes.
++	contentTypes := r.Header.Values("Content-Type")
++	if len(contentTypes) != 1 {
++		w.WriteHeader(http.StatusUnsupportedMediaType)
++		return
++	}
++	mediaType, _, err := mime.ParseMediaType(contentTypes[0])
++	if err != nil || mediaType != "application/json" {
++		w.WriteHeader(http.StatusUnsupportedMediaType)
++		return
++	}
++	if !s.libraryMutationOriginAllowed(r) {
++		w.WriteHeader(http.StatusForbidden)
++		return
++	}
++
 +	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 +	var payload struct {
 +		Uri      string `json:"uri"`
@@ -690,6 +829,28 @@ index 02bf0b2..4a70dd6 100644
 +	}
 +	data := ApiLibrarySave{Uri: payload.Uri, Saved: *payload.Saved, Username: payload.Username}
 +	s.handleRequest(ApiRequest{Type: ApiRequestTypeLibrarySave, Data: data}, w)
++}
++
++func (s *ConcreteApiServer) libraryMutationOriginAllowed(r *http.Request) bool {
++	origins := r.Header.Values("Origin")
++	if len(origins) == 0 {
++		return true // Native clients do not send a browser Origin.
++	}
++	if len(origins) != 1 {
++		return false
++	}
++
++	// Accept only an explicit HTTP(S) origin. In particular, an opaque "null"
++	// origin cannot identify a trusted site, even with a wildcard allow_origin.
++	origin, err := url.Parse(origins[0])
++	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") ||
++		origin.Host == "" || origin.User != nil || strings.ContainsAny(origin.Host, " ,\\\t\r\n") ||
++		origins[0] != origin.Scheme+"://"+origin.Host {
++		return false
++	}
++	// Use the same configured origins and wildcard semantics as preflight.
++	// Do not trust Host as an implicit allowlist: it is supplied by the caller.
++	return s.cors().OriginAllowed(r)
 +}
 diff --git a/daemon/api_server_test.go b/daemon/api_server_test.go
 index 63aa856..dfb98c2 100644
@@ -766,7 +927,7 @@ index 1479539..e9f2b19 100644
  						// The device name drives the zeroconf advertisement, which
  						// runs independently of any player session, so handle it
 diff --git a/daemon/controls.go b/daemon/controls.go
-index 27f3dd1..0d4d420 100644
+index 27f3dd1..0d592aa 100644
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
 @@ -14,7 +14,6 @@ import (
@@ -828,30 +989,32 @@ index 27f3dd1..0d4d420 100644
  	switch ev.Type {
  	case player.EventTypePlay:
  		p.state.player.IsPlaying = true
-@@ -253,6 +264,11 @@ func (p *AppPlayer) handlePlayerEvent(ev *player.Event) {
+@@ -253,6 +264,13 @@ func (p *AppPlayer) handlePlayerEvent(ev *player.Event) {
  			},
  		})
  	case player.EventTypeNotPlaying:
-+		if p.prefetchKeyFailure && p.playbackCooldownError() != nil && !p.sleepAtEndOfTrack {
-+			p.stopAfterPrefetchRefusal()
++		// The lane arms the shared cooldown before its result reaches this
++		// loop. It also applies to stale loads and invalidated prefetches.
++		if p.playbackCooldownError() != nil && !p.sleepAtEndOfTrack {
++			p.stopAfterAudioKeyRefusal()
 +			return
 +		}
 +		p.prefetchKeyFailure = false
  		p.sess.Events().OnPlayerEnd(p.primaryStream, p.state.trackPosition())
  
  		// Played to the end: clear the resume point before advancing, so that
-@@ -325,6 +341,26 @@ type skipToFunc func(*connectpb.ContextTrack) bool
+@@ -325,6 +343,27 @@ type skipToFunc func(*connectpb.ContextTrack) bool
  // and walking it to the starting track runs on the loader lane, and the track
  // it lands on is loaded once it has.
  func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, paused, drop bool, then func(error)) {
-+	var queued []*connectpb.ContextTrack
++	queued := p.pendingContextQueue
 +	if p.state.tracks != nil {
-+		queued = p.state.tracks.UpcomingQueue()
++		queued = p.state.tracks.UpcomingQueue
 +	}
 +	p.loadContextWithQueue(spotCtx, skipTo, paused, drop, queued, then)
 +}
 +
-+func (p *AppPlayer) loadContextWithQueue(spotCtx *connectpb.Context, skipTo skipToFunc, paused, drop bool, queued []*connectpb.ContextTrack, then func(error)) {
++func (p *AppPlayer) loadContextWithQueue(spotCtx *connectpb.Context, skipTo skipToFunc, paused, drop bool, queue func() []*connectpb.ContextTrack, then func(error)) {
 +	if err := p.playbackCooldownError(); err != nil {
 +		then(err)
 +		return
@@ -859,15 +1022,16 @@ index 27f3dd1..0d4d420 100644
 +
 +	p.retryContext = func() {
 +		dj := p.djPlayback
-+		p.loadContextWithQueue(spotCtx, skipTo, false, true, queued, then)
++		p.loadContextWithQueue(spotCtx, skipTo, false, true, queue, then)
 +		p.djPlayback = dj
 +	}
++	p.pendingContextQueue = queue
 +	p.state.tracks = nil
 +	p.djPlayback = nil
  	p.state.setPaused(paused)
  
  	sessionId := make([]byte, 16)
-@@ -368,15 +404,6 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+@@ -368,30 +407,32 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
  	shuffle := p.state.player.Options.ShufflingContext
  	p.loadGen++
  
@@ -883,7 +1047,12 @@ index 27f3dd1..0d4d420 100644
  	p.loader.submit(loaderJob{
  		name:  "resolve " + spotCtx.Uri,
  		class: classLoad,
-@@ -385,13 +412,19 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+ 		gen:   p.loadGen,
+ 		run: func(ctx context.Context) loaderResult {
++			var queued []*connectpb.ContextTrack
++			if queue != nil {
++				queued = queue()
++			}
  			list, snap, err := resolveContext(ctx, p.app.log, p.sess.Spclient(), spotCtx, skipTo, shuffle, queued)
  			if err != nil {
  				return loaderResult{
@@ -902,14 +1071,16 @@ index 27f3dd1..0d4d420 100644
  			return loaderResult{
  				commit: func(p *AppPlayer, err error) {
 +					p.retryContext = nil
++					p.pendingContextQueue = nil
  					p.state.tracks = list
  					p.state.player.ContextMetadata = contextMetadata(spotCtx.Metadata, snap.Metadata)
  					p.publishSnapshot(snap)
-@@ -419,7 +452,12 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+@@ -419,7 +460,13 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
  // around the stream are replaced once the context has resolved, and the stream
  // itself is left alone.
  func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sentBy string, paused, continuation bool) {
 +	p.djPlayback = nil
++	p.pendingContextQueue = nil
  	spotCtx := transferState.CurrentSession.Context
 +	if !continuation {
 +		p.retryContext = func() { p.transferContext(transferState, sentBy, false, false) }
@@ -918,7 +1089,7 @@ index 27f3dd1..0d4d420 100644
  	shuffle := transferState.Options.GetShufflingContext()
  	current := transferState.Playback.CurrentTrack
  	queue := transferState.Queue
-@@ -435,8 +473,14 @@ func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sent
+@@ -435,8 +482,14 @@ func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sent
  			return loaderResult{err: err}
  		}
  		return loaderResult{
@@ -935,7 +1106,7 @@ index 27f3dd1..0d4d420 100644
  		}
  	}
  
-@@ -538,6 +582,7 @@ func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sent
+@@ -538,6 +591,7 @@ func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sent
  					}
  
  					p.state.queueID = highestQueueID(queue.GetTracks())
@@ -943,16 +1114,17 @@ index 27f3dd1..0d4d420 100644
  					p.state.tracks = list
  					p.state.player.ContextMetadata = contextMetadata(played.Metadata, snap.Metadata)
  					p.publishSnapshot(snap)
-@@ -627,6 +672,8 @@ func abs(v int64) int64 {
+@@ -627,6 +681,9 @@ func abs(v int64) int64 {
  // cast onto it can start something else straight away. That is why this is not
  // stopPlayback, which hands a zeroconf session back.
  func (p *AppPlayer) abandonTransfer() {
 +	p.retryContext = nil
++	p.pendingContextQueue = nil
 +	p.djPlayback = nil
  	// Anything still playing belongs to whatever came before the transfer, and
  	// is not what the state is about to describe. Stopping it announces itself
  	// through the player's stop event.
-@@ -738,12 +785,10 @@ func resolveContext(ctx context.Context, log librespot.Logger, sp *spclient.Spcl
+@@ -738,12 +795,10 @@ func resolveContext(ctx context.Context, log librespot.Logger, sp *spclient.Spcl
  
  // isUnplayableMedia reports whether a load failed for a reason that skipping
  // forward can get past: media the account may not play, media in no format the
@@ -967,7 +1139,7 @@ index 27f3dd1..0d4d420 100644
  }
  
  // loadCurrentTrackOrSkip loads the current track; if it is unplayable it
-@@ -776,9 +821,13 @@ func (p *AppPlayer) loadCurrentTrackOrSkip(paused, drop, resume bool, then func(
+@@ -776,9 +831,13 @@ func (p *AppPlayer) loadCurrentTrackOrSkip(paused, drop, resume bool, then func(
  //
  // The fetch is held back by delay, during which a newer load drops it unstarted.
  // Once started it cannot be recalled: the audio key request goes out before the
@@ -983,7 +1155,7 @@ index 27f3dd1..0d4d420 100644
  	if p.primaryStream != nil {
  		unloadPosition := p.player.PositionMs()
  		p.sess.Events().OnPrimaryStreamUnload(p.primaryStream, unloadPosition)
-@@ -893,6 +942,9 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
+@@ -893,6 +952,9 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
  					err: err,
  					commit: func(p *AppPlayer, err error) {
  						p.emitPlaybackError(playbackErrorStageLoad, spotId.Uri(), err)
@@ -993,7 +1165,7 @@ index 27f3dd1..0d4d420 100644
  						then(err)
  					},
  				}
-@@ -935,6 +987,13 @@ type fetchTrackOpts struct {
+@@ -935,6 +997,13 @@ type fetchTrackOpts struct {
  	prefetchedSource librespot.AudioSource
  }
  
@@ -1007,7 +1179,7 @@ index 27f3dd1..0d4d420 100644
  // fetchTrack builds the stream for a track and hands it to the player. Runs on
  // the loader lane, so it touches nothing the player loop owns.
  // The stream generation it returns identifies the events the player will raise
-@@ -946,7 +1005,7 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+@@ -946,7 +1015,7 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
  	stream := opts.prefetchedStream
  	if stream == nil {
  		var err error
@@ -1016,16 +1188,18 @@ index 27f3dd1..0d4d420 100644
  			return nil, 0, fmt.Errorf("failed creating stream for %s: %w", spotId, err)
  		}
  	} else if !opts.fromStart {
-@@ -999,6 +1058,8 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+@@ -999,7 +1068,10 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
  
  // commitLoad reports the track the player is now on. Runs on the player loop.
  func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, trackPosition int64, prefetched bool) {
 +	p.playbackFailure = nil
 +	p.prefetchKeyFailure = false
  	p.primaryStream = stream
++	p.primaryRequestedURI = uri
  
  	// A play or pause that arrived while this was loading asked for a state the
-@@ -1035,6 +1096,8 @@ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, t
+ 	// stream was not loaded in, so apply it now.
+@@ -1035,6 +1107,8 @@ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, t
  	p.state.player.IsPlaying = true
  	p.state.player.IsBuffering = false
  	p.state.setPaused(paused) // update IsPaused and PlaybackSpeed
@@ -1034,7 +1208,7 @@ index 27f3dd1..0d4d420 100644
  	p.updateState()
  	p.schedulePrefetchNext()
  
-@@ -1208,7 +1271,32 @@ func (p *AppPlayer) setQueue(prev []*connectpb.ContextTrack, next []*connectpb.C
+@@ -1208,7 +1282,32 @@ func (p *AppPlayer) setQueue(prev []*connectpb.ContextTrack, next []*connectpb.C
  }
  
  func (p *AppPlayer) play() error {
@@ -1067,7 +1241,7 @@ index 27f3dd1..0d4d420 100644
  		// Asked for during a load: record it so the track starts playing when
  		// it lands, rather than losing the command.
  		if p.loadInFlight {
-@@ -1237,6 +1325,7 @@ func (p *AppPlayer) play() error {
+@@ -1237,6 +1336,7 @@ func (p *AppPlayer) play() error {
  	p.state.player.Timestamp = time.Now().UnixMilli()
  	p.state.player.PositionAsOfTimestamp = streamPos
  	p.state.setPaused(false)
@@ -1075,7 +1249,7 @@ index 27f3dd1..0d4d420 100644
  	p.updateState()
  	p.schedulePrefetchNext()
  
-@@ -1337,6 +1426,14 @@ func (p *AppPlayer) noteSkip() time.Duration {
+@@ -1337,6 +1437,14 @@ func (p *AppPlayer) noteSkip() time.Duration {
  }
  
  func (p *AppPlayer) skipPrev(allowSeeking bool) error {
@@ -1090,7 +1264,7 @@ index 27f3dd1..0d4d420 100644
  	// The position read here belongs to the stream on its way out while a load
  	// is outstanding: a second press means the track before it, not a restart.
  	if allowSeeking && !p.loadInFlight && p.player.PositionMs() > 3000 {
-@@ -1379,6 +1476,14 @@ func (p *AppPlayer) skipPrev(allowSeeking bool) error {
+@@ -1379,6 +1487,14 @@ func (p *AppPlayer) skipPrev(allowSeeking bool) error {
  }
  
  func (p *AppPlayer) skipNext(track *connectpb.ContextTrack) error {
@@ -1105,7 +1279,7 @@ index 27f3dd1..0d4d420 100644
  	p.sess.Events().OnPlayerSkipForward(p.primaryStream, p.player.PositionMs(), track != nil)
  
  	delay := p.noteSkip()
-@@ -1440,7 +1545,7 @@ func (p *AppPlayer) skipNext(track *connectpb.ContextTrack) error {
+@@ -1440,7 +1556,7 @@ func (p *AppPlayer) skipNext(track *connectpb.ContextTrack) error {
  	return nil
  }
  
@@ -1114,7 +1288,7 @@ index 27f3dd1..0d4d420 100644
  // past in a row before stopping, so a fully-gated context can't loop forever.
  const maxConsecutiveUnplayableSkips = 50
  
-@@ -1449,6 +1554,11 @@ const maxConsecutiveUnplayableSkips = 50
+@@ -1449,6 +1565,11 @@ const maxConsecutiveUnplayableSkips = 50
  // by maxConsecutiveUnplayableSkips so a fully gated context cannot loop forever.
  // delay holds back the load it ends in, see loadCurrentTrack.
  func (p *AppPlayer) advanceNext(forceNext, drop bool, delay time.Duration, then func(hasNextTrack bool, err error)) {
@@ -1126,7 +1300,7 @@ index 27f3dd1..0d4d420 100644
  	if p.state.tracks == nil {
  		p.advanceTo(false, nil, drop, delay, then)
  		return
-@@ -1519,11 +1629,7 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
+@@ -1519,11 +1640,7 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
  		p.state.player.IsBuffering = false
  	}
  
@@ -1139,7 +1313,7 @@ index 27f3dd1..0d4d420 100644
  	p.loadCurrentTrack(!hasNextTrack, drop, true, delay, func(err error) {
  		if err == nil {
  			p.consecutiveUnplayableSkips = 0
-@@ -1537,15 +1643,10 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
+@@ -1537,15 +1654,10 @@ func (p *AppPlayer) advanceTo(hasNextTrack bool, seed []string, drop bool, delay
  			return
  		}
  
@@ -1157,11 +1331,12 @@ index 27f3dd1..0d4d420 100644
  		// the first playable track instead of freezing, and can never recurse forever.
  		p.consecutiveUnplayableSkips++
  		if p.consecutiveUnplayableSkips > maxConsecutiveUnplayableSkips {
-@@ -1665,6 +1766,9 @@ func (p *AppPlayer) volumeUpdated() {
+@@ -1665,6 +1777,10 @@ func (p *AppPlayer) volumeUpdated() {
  }
  
  func (p *AppPlayer) stopPlayback() {
 +	p.retryContext = nil
++	p.pendingContextQueue = nil
 +	p.recoverySelecting = false
 +	p.djPlayback = nil
  	// Whatever is being loaded is not wanted any more. Cancel it, and make
@@ -2283,10 +2458,10 @@ index 0000000..79f544b
 +}
 diff --git a/daemon/library_api_test.go b/daemon/library_api_test.go
 new file mode 100644
-index 0000000..198e6cd
+index 0000000..b08c4fc
 --- /dev/null
 +++ b/daemon/library_api_test.go
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,184 @@
 +package daemon
 +
 +import (
@@ -2312,7 +2487,9 @@ index 0000000..198e6cd
 +	} {
 +		s := &ConcreteApiServer{requests: make(chan ApiRequest, 1)}
 +		recorder := httptest.NewRecorder()
-+		s.SaveLibraryTrack(recorder, httptest.NewRequest(http.MethodPost, "/library/save", strings.NewReader(body)))
++		req := httptest.NewRequest(http.MethodPost, "/library/save", strings.NewReader(body))
++		req.Header.Set("Content-Type", "application/json")
++		s.SaveLibraryTrack(recorder, req)
 +		require.Equal(t, http.StatusBadRequest, recorder.Code)
 +		require.Empty(t, s.requests, "invalid payload must not reach player or mutate the library")
 +	}
@@ -2332,7 +2509,11 @@ index 0000000..198e6cd
 +			received := make(chan ApiRequest, 1)
 +			go func() { req := <-s.requests; received <- req; req.Reply(&ApiLibrarySaved{Saved: false}, nil) }()
 +			recorder := httptest.NewRecorder()
-+			Handler(s).ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)))
++			reqHTTP := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
++			if tc.body != "" {
++				reqHTTP.Header.Set("Content-Type", "application/json")
++			}
++			s.handler().ServeHTTP(recorder, reqHTTP)
 +			require.Equal(t, http.StatusOK, recorder.Code)
 +			req := <-received
 +			require.Equal(t, tc.kind, req.Type)
@@ -2349,6 +2530,110 @@ index 0000000..198e6cd
 +			default:
 +				t.Fatalf("unexpected payload type %T", data)
 +			}
++		})
++	}
++}
++
++func TestLibrarySaveRequiresJSONAndTrustedOrigin(t *testing.T) {
++	const trusted = "https://controller.example"
++	const hostile = "http://attacker.example"
++	for _, tc := range []struct {
++		name         string
++		allowOrigin  string
++		origins      []string
++		contentTypes []string
++		status       int
++	}{
++		{"native JSON", "", nil, []string{"application/json"}, http.StatusOK},
++		{"native JSON charset", "", nil, []string{"application/json; charset=utf-8"}, http.StatusOK},
++		{"native JSON media type case", "", nil, []string{"Application/JSON"}, http.StatusOK},
++		{"native with configured origin", trusted, nil, []string{"application/json"}, http.StatusOK},
++		{"missing media type", "", nil, nil, http.StatusUnsupportedMediaType},
++		{"native plain text", "", nil, []string{"text/plain"}, http.StatusUnsupportedMediaType},
++		{"hostile simple plain text", "", []string{hostile}, []string{"text/plain"}, http.StatusUnsupportedMediaType},
++		{"form encoded", "", nil, []string{"application/x-www-form-urlencoded"}, http.StatusUnsupportedMediaType},
++		{"multipart form", "", nil, []string{"multipart/form-data; boundary=boundary"}, http.StatusUnsupportedMediaType},
++		{"invalid media type", "", nil, []string{"application/json; charset"}, http.StatusUnsupportedMediaType},
++		{"multiple media types", "", nil, []string{"application/json", "text/plain"}, http.StatusUnsupportedMediaType},
++		{"hostile JSON", "", []string{hostile}, []string{"application/json"}, http.StatusForbidden},
++		{"host alone does not authorize origin", "", []string{"http://127.0.0.1:3678"}, []string{"application/json"}, http.StatusForbidden},
++		{"configured origin", trusted, []string{trusted}, []string{"application/json"}, http.StatusOK},
++		{"configured origin still requires JSON", trusted, []string{trusted}, []string{"text/plain"}, http.StatusUnsupportedMediaType},
++		{"different origin", trusted, []string{hostile}, []string{"application/json"}, http.StatusForbidden},
++		{"different scheme", trusted, []string{"http://controller.example"}, []string{"application/json"}, http.StatusForbidden},
++		{"different port", trusted, []string{trusted + ":8443"}, []string{"application/json"}, http.StatusForbidden},
++		{"origin suffix attack", trusted, []string{trusted + ".attacker.example"}, []string{"application/json"}, http.StatusForbidden},
++		{"configured wildcard", "https://*.controller.example", []string{"https://app.controller.example"}, []string{"application/json"}, http.StatusOK},
++		{"wildcard outside domain", "https://*.controller.example", []string{hostile}, []string{"application/json"}, http.StatusForbidden},
++		{"explicit all origins", "*", []string{trusted}, []string{"application/json"}, http.StatusOK},
++		{"opaque origin despite wildcard", "*", []string{"null"}, []string{"application/json"}, http.StatusForbidden},
++		{"opaque origin despite explicit config", "null", []string{"null"}, []string{"application/json"}, http.StatusForbidden},
++		{"empty origin is not native", "*", []string{""}, []string{"application/json"}, http.StatusForbidden},
++		{"multiple origins", "*", []string{trusted, hostile}, []string{"application/json"}, http.StatusForbidden},
++		{"origin with path", "*", []string{trusted + "/path"}, []string{"application/json"}, http.StatusForbidden},
++		{"origin with credentials", "*", []string{"https://user@controller.example"}, []string{"application/json"}, http.StatusForbidden},
++		{"non-web origin", "*", []string{"file://controller.example"}, []string{"application/json"}, http.StatusForbidden},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			s := &ConcreteApiServer{log: &librespot.NullLogger{}, allowOrigin: tc.allowOrigin, requests: make(chan ApiRequest, 1)}
++			dispatched := make(chan ApiRequest, 1)
++			done := make(chan struct{})
++			defer close(done)
++			go func() {
++				select {
++				case req := <-s.requests:
++					dispatched <- req
++					req.Reply(&ApiLibrarySaved{Saved: false}, nil)
++				case <-done:
++				}
++			}()
++
++			r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:3678/library/save", strings.NewReader(`{"uri":"spotify:track:0000000000000000000001","username":"account","saved":false}`))
++			for _, origin := range tc.origins {
++				r.Header.Add("Origin", origin)
++			}
++			for _, contentType := range tc.contentTypes {
++				r.Header.Add("Content-Type", contentType)
++			}
++			w := httptest.NewRecorder()
++			// This includes the exact CORS middleware installed by serve().
++			s.handler().ServeHTTP(w, r)
++			require.Equal(t, tc.status, w.Code)
++			if tc.status != http.StatusOK {
++				require.Empty(t, s.requests, "rejected requests must not reach the player")
++				require.Empty(t, dispatched, "rejected requests must not mutate the library")
++				return
++			}
++			require.Len(t, dispatched, 1)
++			req := <-dispatched
++			require.Equal(t, ApiRequestTypeLibrarySave, req.Type)
++			require.Equal(t, ApiLibrarySave{Uri: "spotify:track:0000000000000000000001", Username: "account", Saved: false}, req.Data)
++			require.JSONEq(t, `{"saved":false}`, w.Body.String())
++		})
++	}
++}
++
++func TestLibrarySavePreflightUsesConfiguredOriginPolicy(t *testing.T) {
++	for _, tc := range []struct{ name, allowOrigin, origin, allowed string }{
++		{"default denies", "", "https://attacker.example", ""},
++		{"configured allows", "https://controller.example", "https://controller.example", "https://controller.example"},
++		{"configured denies", "https://controller.example", "https://attacker.example", ""},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			s := &ConcreteApiServer{allowOrigin: tc.allowOrigin, requests: make(chan ApiRequest, 1)}
++			r := httptest.NewRequest(http.MethodOptions, "/library/save", nil)
++			r.Header.Set("Origin", tc.origin)
++			r.Header.Set("Access-Control-Request-Method", http.MethodPost)
++			r.Header.Set("Access-Control-Request-Headers", "content-type")
++			w := httptest.NewRecorder()
++			s.handler().ServeHTTP(w, r)
++			require.Equal(t, http.StatusNoContent, w.Code)
++			require.Equal(t, tc.allowed, w.Header().Get("Access-Control-Allow-Origin"))
++			if tc.allowed != "" {
++				require.Equal(t, "POST", w.Header().Get("Access-Control-Allow-Methods"))
++				require.Equal(t, "content-type", w.Header().Get("Access-Control-Allow-Headers"))
++			}
++			require.Empty(t, s.requests, "preflight must not mutate the library")
 +		})
 +	}
 +}
@@ -2812,10 +3097,10 @@ index 0000000..dff405e
 +	}
 +}
 diff --git a/daemon/loader.go b/daemon/loader.go
-index ec0641d..f6bc2ad 100644
+index ec0641d..ba8397b 100644
 --- a/daemon/loader.go
 +++ b/daemon/loader.go
-@@ -47,6 +47,27 @@ func (r replyTo) done(data any, err error) {
+@@ -47,6 +47,29 @@ func (r replyTo) done(data any, err error) {
  // applyLoaderResult folds a finished job back into the state. Runs on the Run
  // goroutine, which is what makes commit safe to write state from.
  func (p *AppPlayer) applyLoaderResult(res loaderResult) {
@@ -2829,7 +3114,9 @@ index ec0641d..f6bc2ad 100644
 +			p.prefetchGen++
 +			p.prefetchTimer.Stop()
 +			p.clearUpcoming()
-+		} else {
++		} else if !p.recoverySelecting {
++			// EOF can observe the lane's cooldown before this result arrives.
++			// Keep the successor selection it already started for manual retry.
 +			p.stopForAudioKey()
 +		}
 +		if fresh && res.commit != nil {
@@ -2843,7 +3130,7 @@ index ec0641d..f6bc2ad 100644
  	if res.class == classLoad && res.gen == p.loadGen {
  		p.loadInFlight = false
  
-@@ -277,10 +298,11 @@ type loaderResult struct {
+@@ -277,10 +300,11 @@ type loaderResult struct {
  	class loaderClass
  	reply replyTo
  
@@ -2859,7 +3146,7 @@ index ec0641d..f6bc2ad 100644
  }
  
  type runningJob struct {
-@@ -297,10 +319,11 @@ type loaderLane struct {
+@@ -297,10 +321,11 @@ type loaderLane struct {
  	ctx    context.Context
  	cancel context.CancelFunc
  
@@ -2875,7 +3162,7 @@ index ec0641d..f6bc2ad 100644
  
  	wake    chan struct{}
  	results chan loaderResult
-@@ -334,6 +357,12 @@ func (l *loaderLane) submit(job loaderJob) {
+@@ -334,6 +359,12 @@ func (l *loaderLane) submit(job loaderJob) {
  		return
  	}
  
@@ -2888,7 +3175,7 @@ index ec0641d..f6bc2ad 100644
  	switch job.class {
  	case classLoad, classNav:
  		dropped = l.dropLoadsLocked()
-@@ -490,7 +519,15 @@ func (l *loaderLane) execute(job loaderJob, ctx context.Context) loaderResult {
+@@ -490,7 +521,15 @@ func (l *loaderLane) execute(job loaderJob, ctx context.Context) loaderResult {
  		l.mu.Unlock()
  	}()
  
@@ -2980,10 +3267,10 @@ index 3a266e1..4a9e296 100644
  		{"too many requests", status(429), playbackErrorKindRateLimited},
 diff --git a/daemon/playback_recovery.go b/daemon/playback_recovery.go
 new file mode 100644
-index 0000000..f811971
+index 0000000..f2e7cfe
 --- /dev/null
 +++ b/daemon/playback_recovery.go
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,163 @@
 +package daemon
 +
 +import (
@@ -3091,11 +3378,11 @@ index 0000000..f811971
 +	p.emitMprisUpdate(mpris.Stopped)
 +}
 +
-+// A healthy primary may finish before a refused prefetch's cooldown expires.
++// A healthy primary may finish during the shared audio-key cooldown.
 +// Move only the retry selection to its successor; never fetch media or consume
 +// a DJ cursor. This explicit navigation is the one exception to dropping
 +// ordinary queued controls during recovery.
-+func (p *AppPlayer) stopAfterPrefetchRefusal() {
++func (p *AppPlayer) stopAfterAudioKeyRefusal() {
 +	p.stopForAudioKey()
 +	p.state.player.PositionAsOfTimestamp = 0
 +	if p.state.player.Options.RepeatingTrack {
@@ -3103,11 +3390,18 @@ index 0000000..f811971
 +	}
 +	gen := p.loadGen
 +	p.recoverySelecting = true
++	repeatingContext := p.state.player.Options.RepeatingContext
 +	var hasNext bool
 +	// An explicit empty hint avoids fetching surrounding pages just to select
-+	// the retry target, which the refused prefetch already resolved.
-+	p.listJob("select next after refused prefetch", classMutate, []*connectpb.ContextTrack{},
-+		func(ctx context.Context, list *tracks.List) error { hasNext = list.GoNext(ctx); return nil },
++	// the retry target. No stream is loaded while this selection is pending.
++	p.listJob("select next after audio-key refusal", classMutate, []*connectpb.ContextTrack{},
++		func(ctx context.Context, list *tracks.List) error {
++			hasNext = list.GoNext(ctx)
++			if !hasNext && repeatingContext {
++				hasNext = list.GoStart(ctx)
++			}
++			return nil
++		},
 +		func(p *AppPlayer, snap *tracks.Snapshot, err error) {
 +			if gen != p.loadGen {
 +				return
@@ -3139,6 +3433,206 @@ index 0000000..f811971
 +	}
 +	l.mu.Unlock()
 +	replyAll(dropped, ErrSuperseded)
++}
+diff --git a/daemon/playback_recovery_context_test.go b/daemon/playback_recovery_context_test.go
+new file mode 100644
+index 0000000..b431551
+--- /dev/null
++++ b/daemon/playback_recovery_context_test.go
+@@ -0,0 +1,194 @@
++//go:build test_unit
++
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/audio"
++	"github.com/devgianlu/go-librespot/dealer"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
++	"github.com/stretchr/testify/require"
++)
++
++func playRecoveryContext(t *testing.T, p *AppPlayer, n byte) {
++	t.Helper()
++	var req dealer.RequestPayload
++	req.Command.Endpoint = "play"
++	req.Command.Context = &connectpb.Context{
++		Uri:   fmt.Sprintf("spotify:playlist:context%d", n),
++		Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: trackUri(n)}}}},
++	}
++	req.Command.PlayOrigin = &connectpb.PlayOrigin{}
++	require.NoError(t, p.handlePlayerCommand(req))
++}
++
++func TestSupersedingContextPreservesExplicitQueue(t *testing.T) {
++	for _, resolved := range []bool{false, true} {
++		t.Run(fmt.Sprint("resolved=", resolved), func(t *testing.T) {
++			p := recoveryPlayer(t)
++			p.sess = &session.Session{}
++			p.state.tracks.AddToQueue(&connectpb.ContextTrack{Uri: queuedUri, Uid: "q0"})
++			playRecoveryContext(t, p, 4)
++			require.Nil(t, p.state.tracks, "the new context must not expose the old list")
++			var oldResult loaderResult
++			if resolved {
++				require.Len(t, p.loader.queue, 1)
++				job := p.loader.queue[0]
++				p.loader.queue = nil
++				oldResult = p.loader.execute(job, t.Context())
++				require.NoError(t, oldResult.err)
++			}
++			playRecoveryContext(t, p, 5)
++			if resolved {
++				p.applyLoaderResult(oldResult)
++			}
++			require.Nil(t, p.state.tracks, "a stale result must not install the superseded list")
++			runQueuedJob(t, p)
++			require.Equal(t, "spotify:playlist:context5", p.state.player.ContextUri)
++			require.Equal(t, trackUri(5), p.state.player.Track.GetUri())
++			require.Equal(t, []string{queuedUri}, trackUris(p.state.player.NextTracks))
++			require.Equal(t, "q0", p.state.player.NextTracks[0].Uid)
++		})
++	}
++}
++
++func TestContextQueueIncludesAlreadyAcceptedMutation(t *testing.T) {
++	p := recoveryPlayer(t)
++	p.sess = &session.Session{}
++	list := p.state.tracks
++	p.loader.submit(loaderJob{
++		class: classMutate,
++		run: func(context.Context) loaderResult {
++			list.AddToQueue(&connectpb.ContextTrack{Uri: queuedUri, Uid: "q0"})
++			return loaderResult{}
++		},
++	})
++	playRecoveryContext(t, p, 4)
++	playRecoveryContext(t, p, 5)
++	require.Len(t, p.loader.queue, 2)
++	mutation := p.loader.queue[0]
++	p.loader.queue = p.loader.queue[1:]
++	p.applyLoaderResult(p.loader.execute(mutation, t.Context()))
++	runQueuedJob(t, p)
++	require.Equal(t, []string{queuedUri}, trackUris(p.state.player.NextTracks))
++}
++
++func TestSupersededContextRetryRetainsQueue(t *testing.T) {
++	p := recoveryPlayer(t)
++	p.sess = &session.Session{}
++	p.state.tracks.AddToQueue(&connectpb.ContextTrack{Uri: queuedUri, Uid: "q0"})
++	playRecoveryContext(t, p, 4)
++	playRecoveryContext(t, p, 5)
++	p.applyLoaderResult(loaderResult{class: classPrefetch, gen: p.prefetchGen, err: &audio.KeyProviderError{Code: 2}})
++	require.Nil(t, p.state.tracks)
++	require.Empty(t, p.loader.queue)
++	require.NotNil(t, p.apiPlaybackError())
++	expireAudioCooldown(p.loader)
++	require.NoError(t, p.play())
++	runQueuedJob(t, p)
++	require.Equal(t, "spotify:playlist:context5", p.state.player.ContextUri)
++	require.Equal(t, trackUri(5), p.state.player.Track.GetUri())
++	require.Equal(t, []string{queuedUri}, trackUris(p.state.player.NextTracks))
++	require.NotNil(t, p.apiPlaybackError(), "resolving a context alone does not confirm recovery")
++	require.Nil(t, p.pendingContextQueue, "the resolved list now owns the queue")
++}
++
++func TestPendingContextQueueIsDiscardedOnTransferOrStop(t *testing.T) {
++	for _, action := range []string{"transfer", "abandon transfer", "stop"} {
++		t.Run(action, func(t *testing.T) {
++			p := recoveryPlayer(t)
++			p.sess = &session.Session{}
++			p.state.tracks.AddToQueue(&connectpb.ContextTrack{Uri: queuedUri, Uid: "q0"})
++			playRecoveryContext(t, p, 4)
++			switch action {
++			case "transfer":
++				require.NoError(t, p.handlePlayerCommand(playingQueueTransfer(t, "do_not_retain", "u1")))
++			case "abandon transfer":
++				p.abandonTransfer()
++			case "stop":
++				p.stopPlayback()
++			}
++			require.Nil(t, p.state.tracks)
++			playRecoveryContext(t, p, 5)
++			runQueuedJob(t, p)
++			require.Equal(t, trackUri(5), p.state.player.Track.GetUri())
++			require.Empty(t, p.state.player.NextTracks, "an abandoned context must not restore its old queue")
++		})
++	}
++}
++
++func TestAnyRefusalDuringHealthyPlaybackStopsAtEOFWithRetryTarget(t *testing.T) {
++	for _, kind := range []string{"stale prefetch", "stale load", "refusal result pending"} {
++		for _, selection := range []string{"next", "queue", "repeat track", "repeat context"} {
++			t.Run(kind+"/"+selection, func(t *testing.T) {
++				p := recoveryPlayer(t)
++				healthy := playingTrack(t, p, trackUri(1), "one")
++				want := trackUri(2)
++				switch selection {
++				case "queue":
++					p.state.tracks.AddToQueue(&connectpb.ContextTrack{Uri: queuedUri, Uid: "q0"})
++					want = queuedUri
++				case "repeat track":
++					p.state.player.Options.RepeatingTrack = true
++					want = trackUri(1)
++				case "repeat context":
++					require.True(t, p.state.tracks.GoNext(t.Context()))
++					require.True(t, p.state.tracks.GoNext(t.Context()))
++					healthy = playingTrack(t, p, trackUri(3), "three")
++					want = trackUri(1)
++				}
++				res := loaderResult{class: classPrefetch, gen: p.prefetchGen, err: &audio.KeyProviderError{Code: 2}}
++				// An option change cancels prefetch, but the key request may
++				// already be on the wire and still return a refusal.
++				_, err := p.handleApiRequest(ApiRequest{Type: ApiRequestTypeSetRepeatingContext, Data: true})
++				require.NoError(t, err)
++				if kind == "stale load" {
++					res.class = classLoad
++					res.gen = p.loadGen
++					p.loadGen++
++				}
++				if kind == "refusal result pending" {
++					res.audioKeyRetryAt = p.loader.refuseAudioKey()
++				} else {
++					p.applyLoaderResult(res)
++				}
++				require.Same(t, healthy, p.primaryStream)
++				require.Nil(t, p.apiPlaybackError())
++				keyRequests := 0
++				p.streamFactory = func(context.Context, librespot.SpotifyId, int64) (*player.Stream, error) {
++					keyRequests++
++					return nil, &audio.KeyProviderError{Code: 2}
++				}
++				require.NotPanics(t, func() { p.handlePlayerEvent(&player.Event{Type: player.EventTypeNotPlaying}) })
++				if kind == "refusal result pending" {
++					p.applyLoaderResult(res)
++				}
++				require.False(t, p.state.player.IsPlaying)
++				require.False(t, p.state.player.IsBuffering)
++				require.True(t, p.state.player.IsPaused)
++				require.Nil(t, p.primaryStream)
++				require.NotNil(t, p.apiPlaybackError())
++				if selection != "repeat track" {
++					require.True(t, p.recoverySelecting)
++					runQueuedJob(t, p)
++				}
++				require.Equal(t, want, p.state.player.Track.GetUri())
++				require.Equal(t, want, p.apiPlaybackError().Uri)
++				require.ErrorIs(t, p.play(), errPlaybackCooldown)
++				p.prefetchNext()
++				require.Empty(t, p.loader.queue)
++				require.Zero(t, keyRequests)
++				expireAudioCooldown(p.loader)
++				require.NoError(t, p.play())
++				require.Len(t, p.loader.queue, 1)
++				require.Equal(t, "load "+want, p.loader.queue[0].name)
++			})
++		}
++	}
 +}
 diff --git a/daemon/playback_recovery_test.go b/daemon/playback_recovery_test.go
 new file mode 100644
@@ -3590,10 +4084,10 @@ index 0000000..32eb4f9
 +	require.Equal(t, "load "+queuedUri, p.loader.queue[0].name)
 +}
 diff --git a/daemon/player.go b/daemon/player.go
-index 6d62bc1..2c710a5 100644
+index 6d62bc1..22279e1 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -54,13 +54,23 @@ type AppPlayer struct {
+@@ -54,13 +54,28 @@ type AppPlayer struct {
  	initialVolumeOnce sync.Once
  	volumeUpdate      chan float32
  
@@ -3602,6 +4096,11 @@ index 6d62bc1..2c710a5 100644
 +	prefetchKeyFailure bool
 +	recoverySelecting  bool
 +	retryContext       func()
++
++	// pendingContextQueue retains only the source of explicit queued tracks
++	// while a new context resolves, including when another load supersedes it.
++	// Call it on the loader lane, which owns all reads and writes of the list.
++	pendingContextQueue func() []*connectpb.ContextTrack
 +
 +	loader     *loaderLane
 +	djPlayback *djPlayback
@@ -3618,7 +4117,18 @@ index 6d62bc1..2c710a5 100644
  	// loadGen stamps track and context work, prefetchGen what is fetched ahead
  	// for the transition after it. They are separate because a queue edit or
  	// an option change makes whatever was prefetched wrong without making the
-@@ -148,7 +158,7 @@ type AppPlayer struct {
+@@ -105,6 +120,10 @@ type AppPlayer struct {
+ 	primaryStream   *player.Stream
+ 	secondaryStream *player.Stream
+ 
++	// primaryRequestedURI is the selection committed with the primary stream.
++	// Reusing a relinked prefetch can select a different URI from RequestedId.
++	primaryRequestedURI string
++
+ 	// secondarySource is what the player was handed as the secondary.
+ 	secondarySource librespot.AudioSource
+ 
+@@ -148,7 +167,7 @@ type AppPlayer struct {
  	sleepAtEndOfTrack bool
  
  	// consecutiveUnplayableSkips bounds how many unplayable tracks in a row advanceNext will
@@ -3627,7 +4137,7 @@ index 6d62bc1..2c710a5 100644
  	// of refused tracks (even at the very start of a context) advances to the first playable
  	// one instead of freezing, and can never loop forever. Reset to 0 on any successful load.
  	consecutiveUnplayableSkips int
-@@ -321,6 +331,7 @@ func (p *AppPlayer) trackListFromContext(ctx context.Context, spotCtx *connectpb
+@@ -321,6 +340,7 @@ func (p *AppPlayer) trackListFromContext(ctx context.Context, spotCtx *connectpb
  // hands over: its id, options, origin and context. The tracks and the playback
  // are the caller's.
  func (p *AppPlayer) applyTransferSession(transferState *connectpb.TransferState, sentBy string) {
@@ -3635,7 +4145,20 @@ index 6d62bc1..2c710a5 100644
  	if sessId := transferState.CurrentSession.OriginalSessionId; sessId != nil {
  		p.state.player.SessionId = *sessId
  	} else {
-@@ -369,6 +380,13 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
+@@ -357,7 +377,11 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
+ 
+ 	current := transferState.Playback.CurrentTrack
+ 	named := singleTrackContext(current)
+-	if named == nil || named.Uri != p.primaryStream.RequestedId.Uri() {
++	playingURI := p.primaryRequestedURI
++	if playingURI == "" {
++		playingURI = p.primaryStream.RequestedId.Uri()
++	}
++	if named == nil || named.Uri != playingURI {
+ 		return false
+ 	}
+ 
+@@ -369,6 +393,13 @@ func (p *AppPlayer) transferContinues(req dealer.RequestPayload, transferState *
  }
  
  func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
@@ -3649,7 +4172,7 @@ index 6d62bc1..2c710a5 100644
  	p.state.lastCommand = &req
  
  	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
-@@ -647,9 +665,16 @@ func nonEmpty(s string) *string {
+@@ -647,9 +678,16 @@ func nonEmpty(s string) *string {
  }
  
  func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
@@ -3667,7 +4190,7 @@ index 6d62bc1..2c710a5 100644
  	case ApiRequestTypeStatus:
  		resp := &ApiStatus{
  			Username:           p.sess.Username(),
-@@ -664,6 +689,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -664,6 +702,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  			Stopped:            !p.state.player.IsPlaying,
  			Paused:             p.state.player.IsPaused,
  			Buffering:          p.state.player.IsBuffering,
@@ -3675,7 +4198,7 @@ index 6d62bc1..2c710a5 100644
  			PlayOrigin:         nonEmpty(p.state.player.PlayOrigin.FeatureIdentifier),
  			PlayOriginDeviceId: nonEmpty(p.state.player.PlayOrigin.DeviceIdentifier),
  			ContextUri:         nonEmpty(p.state.player.ContextUri),
-@@ -677,6 +703,8 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -677,6 +716,8 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  		resp.NextTrack = p.apiNextTrack()
  
  		return resp, nil
@@ -3684,7 +4207,7 @@ index 6d62bc1..2c710a5 100644
  	case ApiRequestTypeContextTracks:
  		if p.meta == nil {
  			return nil, ErrNotFound
-@@ -735,6 +763,12 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -735,6 +776,12 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  		return nil, nil
  	case ApiRequestTypePlay:
  		data := req.Data.(ApiPlay)
@@ -3697,7 +4220,7 @@ index 6d62bc1..2c710a5 100644
  
  		var skipTo skipToFunc
  		if len(data.SkipToUri) > 0 {
-@@ -767,7 +801,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -767,7 +814,7 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  			gen:   p.loadGen,
  			reply: apiReply(req),
  			run: func(ctx context.Context) loaderResult {
@@ -3706,7 +4229,7 @@ index 6d62bc1..2c710a5 100644
  				if err != nil {
  					return loaderResult{err: fmt.Errorf("failed resolving context: %w", err)}
  				}
-@@ -804,6 +838,9 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+@@ -804,6 +851,9 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
  							}
  						}
  					})

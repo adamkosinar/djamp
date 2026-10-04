@@ -869,22 +869,25 @@ def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: Fals
                 elif not state.get("ready") or not state.get("connected") or not status.get("username"):
                     notice = "Waiting for Spotify to connect…"
                 else:
-                    worker.command("/player/play", {"uri": f"spotify:user:{status['username']}:collection",
-                                                    "skip_to_uri": selected["uri"]})
-                    library_open = False
-                    notice = "Opening your liked song…"
+                    if worker.command("/player/play", {"uri": f"spotify:user:{status['username']}:collection",
+                                                       "skip_to_uri": selected["uri"]}):
+                        library_open = False
+                        notice = "Opening your liked song…"
+                    else:
+                        notice = ""
                 notice_until = time.monotonic() + 4
                 continue
         if key == "v":
             mode = (mode + 1) % 3
             continue
         if key in ("d", "D", "b"):
-            if key in ("d", "D"):
-                library_open = False
             if demo:
+                if key in ("d", "D"):
+                    library_open = False
                 notice = "Demo mode: no Spotify commands are sent."
             elif key in ("d", "D"):
-                worker.command("/player/play", {"uri": DJ_URI})
+                if worker.command("/player/play", {"uri": DJ_URI}):
+                    library_open = False
                 notice = ""
             else:
                 try:
@@ -900,9 +903,12 @@ def run_ui(window, worker, monitor, player, demo=False, should_stop=lambda: Fals
             if value:
                 try:
                     uri = spotify_uri(value)
-                    if not demo:
-                        worker.command("/player/play", {"uri": uri})
-                    notice = "Opening Spotify link…" if not demo else "Demo mode: no Spotify commands are sent."
+                    if demo:
+                        notice = "Demo mode: no Spotify commands are sent."
+                    elif worker.command("/player/play", {"uri": uri}):
+                        notice = "Opening Spotify link…"
+                    else:
+                        notice = ""
                 except ValueError as exc:
                     notice = str(exc)
                 notice_until = time.monotonic() + 6

@@ -64,6 +64,9 @@ terminal and an authenticated backend.
 - Keep library requests off the playback worker. Capture the displayed track
   URI when liking, confirm writes before changing the like indicator, and reject
   stale account/page responses. Keep access tokens in memory and out of logs.
+- Preserve the committed song's library identity when reusing a relinked stream.
+  Library writes require JSON and explicit browser-origin authorization; native
+  clients without an Origin header remain supported.
 - Reuse the Unicode sanitizing and cell-width helpers for displayed metadata.
   Keep narrow terminals, missing metadata, and pairing prompts usable.
 - Follow the go-librespot v0.10.2 API specification linked in the README. The

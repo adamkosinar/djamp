@@ -2,7 +2,7 @@
 
 `upstream.env` pins go-librespot v0.10.2 to commit
 `6a3e25019de8d2893b3fa26b0273d8cc376241c5`. The local build reports
-`0.10.2-djamp.5`; it is an unofficial DJamp extension.
+`0.10.2-djamp.6`; it is an unofficial DJamp extension.
 
 The patch changes resolution of exactly
 `spotify:playlist:37i9dQZF1EYkqdzj48dyYq`: `POST /player/play` asks Spotify's
@@ -48,7 +48,9 @@ Opaque audio-key refusals stop playback instead of automatically skipping songs.
 The loader enforces a ten-second cooldown across playback controls, transfers,
 and background audio fetches, discarding pending playback work. Ordinary queue
 edits and volume changes remain independent. A failed background prefetch leaves
-an already-playing primary stream alone.
+an already-playing primary stream alone. If it ends during the cooldown, the
+player stops with its next selection available for manual retry, even when a
+queue or repeat-mode change made the refused prefetch obsolete.
 
 `GET /status` includes an optional `playback_error` object with `kind`, `message`,
 `uri`, and the remaining `retry_after_ms`. Its message is safe for display and
@@ -66,10 +68,19 @@ The backend also advertises `library: true` and exposes liked-song operations:
 - `POST /library/save` accepts `{uri, saved, username}` with an explicit boolean
   and returns the confirmed `saved` value. Account mismatches return HTTP 409.
 
+Library writes require `Content-Type: application/json` (HTTP 415 otherwise).
+Native clients such as DJamp omit `Origin`. Browser requests must carry a valid
+HTTP(S) origin explicitly permitted by `server.allow_origin`; the default rejects
+browser origins with HTTP 403. CORS response headers alone do not authorize a
+library write.
+
 Playback track metadata includes `requested_uri`, the original track requested
 before any regional substitution, alongside the existing playable `uri`.
 Clients use `requested_uri` for library checks and updates so likes continue to
 refer to the saved version of the song.
+
+Starting a new context preserves explicitly queued songs, including when another
+context change supersedes a pending load.
 
 These use Spotify's internal collection-v2 paging and write endpoints through
 Login5 authentication. The protocol is supported by
@@ -121,7 +132,7 @@ go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.5.0 --config=
 protoc -I proto --go_out=proto --go_opt=paths=source_relative proto/spotify/collection/v2/collection.proto
 gofmt -w daemon/dj_context*.go daemon/library*.go daemon/playback_recovery*.go spclient/collection*.go
 go test -mod=readonly -tags test_unit ./daemon ./spclient ./tracks ./cmd/daemon
-git add -N daemon/dj_context.go daemon/dj_context_test.go daemon/dj_start_test.go tracks/dj_cursor_test.go daemon/library.go daemon/library_test.go daemon/library_api_test.go daemon/library_relink_test.go daemon/api_requested_uri_test.go daemon/playback_recovery.go daemon/playback_recovery_test.go daemon/playback_recovery_transfer_test.go spclient/collection.go spclient/collection_test.go proto/spotify/collection/v2/collection.proto proto/spotify/collection/v2/collection.pb.go
+git add -N daemon/dj_context.go daemon/dj_context_test.go daemon/dj_start_test.go tracks/dj_cursor_test.go daemon/library.go daemon/library_test.go daemon/library_api_test.go daemon/library_relink_test.go daemon/api_requested_uri_test.go daemon/playback_recovery.go daemon/playback_recovery_test.go daemon/playback_recovery_transfer_test.go daemon/playback_recovery_context_test.go spclient/collection.go spclient/collection_test.go proto/spotify/collection/v2/collection.proto proto/spotify/collection/v2/collection.pb.go
 git diff --binary --src-prefix=a/ --dst-prefix=b/ > /path/to/djamp/backend/go-librespot-dj-start.patch
 ```
 
